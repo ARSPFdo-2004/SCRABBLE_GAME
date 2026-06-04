@@ -1,0 +1,6 @@
+numpy>=1.26,<3
+opencv-python>=4.10,<5
+easyocr>=1.7,<2
+pillow>=10,<12
+pytesseract>=0.3.13,<0.4
+pyserial>=3.5,<4
