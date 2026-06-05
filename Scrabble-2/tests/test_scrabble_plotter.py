@@ -38,6 +38,8 @@ from scrabble_plotter.scanner import (
     scan_board_image,
     scan_camera_letters,
     scan_camera_words,
+    score_frame_quality,
+    select_best_frame,
 )
 from scrabble_plotter.scoring import LETTER_VALUES, score_board, square_label
 from scrabble_plotter.serial_sender import format_move_command, format_reset_command, format_steps_command
@@ -317,6 +319,33 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(len(scan.letters), 1)
         self.assertEqual((scan.letters[0].left, scan.letters[0].top), (12, 92))
 
+    def test_scan_camera_letters_keeps_non_white_on_black_text_when_needed(self) -> None:
+        image = _synthetic_white_on_black_text_image()
+
+        scan = scan_camera_letters(
+            image,
+            confidence_threshold=50.0,
+            ocr_reader=lambda frame: [
+                _easyocr_result("B", 0.91, 75, 92, 43, 38),
+            ],
+        )
+
+        self.assertEqual(scan.text(), "B")
+        self.assertEqual(len(scan.letters), 1)
+
+    def test_frame_quality_prefers_sharp_text_frame(self) -> None:
+        cv2 = _require_cv2_for_tests()
+        sharp = _synthetic_white_on_black_text_image()
+        blurred = cv2.GaussianBlur(sharp, (21, 21), 0)
+
+        sharp_quality = score_frame_quality(sharp)
+        blurred_quality = score_frame_quality(blurred)
+        selected, selected_quality = select_best_frame([blurred, sharp])
+
+        self.assertGreater(sharp_quality.score, blurred_quality.score)
+        self.assertGreater(selected_quality.score, blurred_quality.score)
+        self.assertTrue((selected == sharp).all())
+
     def test_paddleocr_v2_parser_filters_text_boxes(self) -> None:
         boxes = parse_paddleocr_text_boxes(
             [
@@ -428,6 +457,24 @@ class ScannerTests(unittest.TestCase):
         )
 
         self.assertEqual([tile.letter for tile in tiles], ["T", "A", "C"])
+
+    def test_detect_camera_tiles_reads_light_tiles_on_dark_board(self) -> None:
+        image = _synthetic_light_tile_board_image(
+            [
+                ("C", 20, 30),
+                ("A", 80, 30),
+                ("T", 140, 30),
+            ]
+        )
+        letters = iter(["C", "A", "T"])
+
+        tiles = detect_camera_tiles(
+            image,
+            confidence_threshold=50.0,
+            ocr_reader=lambda crop: [_easyocr_result(next(letters), 0.91, 0, 0, 68, 68)],
+        )
+
+        self.assertEqual([tile.letter for tile in tiles], ["C", "A", "T"])
 
     def test_scan_camera_words_uses_easyocr_reader(self) -> None:
         image = _synthetic_multi_word_white_on_black_text_image()
@@ -743,6 +790,28 @@ def _synthetic_dark_tile_image(tiles: list[tuple[str, int, int]]):
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.85,
                 (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+    return image
+
+
+def _synthetic_light_tile_board_image(tiles: list[tuple[str, int, int]]):
+    import numpy as np
+
+    cv2 = _require_cv2_for_tests()
+    image = np.full((150, 220, 3), 20, dtype=np.uint8)
+    tile_size = 40
+    for letter, left, top in tiles:
+        cv2.rectangle(image, (left, top), (left + tile_size, top + tile_size), (238, 238, 210), -1)
+        if letter:
+            cv2.putText(
+                image,
+                letter,
+                (left + 11, top + 29),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.85,
+                (20, 20, 20),
                 2,
                 cv2.LINE_AA,
             )

@@ -23,6 +23,7 @@ from .scanner import (
     scan_board_image,
     scan_camera_letters,
     scan_camera_words,
+    select_best_frame,
 )
 from .scoring import (
     ScoreResult,
@@ -41,6 +42,9 @@ from .serial_sender import (
 
 LIVE_LETTER_SCAN_INTERVAL_SECONDS = 4.0
 LIVE_WORD_SCAN_INTERVAL_SECONDS = 4.0
+BEST_CAPTURE_FRAME_COUNT = 18
+BEST_CAPTURE_TIMEOUT_SECONDS = 1.0
+BEST_CAPTURE_FRAME_DELAY_SECONDS = 0.025
 
 
 class ScrabblePlotterApp:
@@ -533,19 +537,18 @@ class ScrabblePlotterApp:
         self.capture_letters_from_camera()
 
     def take_picture_from_camera(self) -> None:
-        if self._latest_frame is None:
-            raise_user_error("Start the camera first.")
-            return
-
-        self._captured_photo_frame = self._latest_frame.copy()
-        self._invalidate_camera_scans()
-        self._last_camera_letter_scan = None
-        self._last_camera_word_scan = None
-        self.captured_letters_var.set("")
-        self._set_camera_words_text("")
-        self._refresh_camera_preview()
-        self._set_status("Picture captured. Click Find Words to identify the words in it.")
-        self._log("Picture captured for EasyOCR word detection.")
+        try:
+            _, quality = self._capture_best_photo_for_ocr("manual picture")
+            self._set_status(
+                f"Best picture captured. Sharpness {quality.sharpness:.0f}; click Find Words or Capture Letters."
+            )
+        except RuntimeError as exc:
+            if str(exc) == "Start the camera first.":
+                raise_user_error(str(exc))
+            else:
+                self._show_error(exc)
+        except Exception as exc:
+            self._show_error(exc)
 
     def resume_live_camera(self) -> None:
         if self._captured_photo_frame is None:
@@ -562,15 +565,54 @@ class ScrabblePlotterApp:
         self._set_status("Live camera view resumed.")
         self._log("Live camera view resumed.")
 
-    def capture_letters_from_camera(self) -> None:
-        frame = self._current_camera_ocr_frame()
-        if frame is None:
-            raise_user_error("Start the camera first.")
-            return
+    def _capture_best_photo_for_ocr(self, reason: str):  # type: ignore[no-untyped-def]
+        frame, quality = self._capture_best_camera_frame()
+        self._captured_photo_frame = frame.copy()
+        self._invalidate_camera_scans()
+        self._last_camera_letter_scan = None
+        self._last_camera_word_scan = None
+        self.captured_letters_var.set("")
+        self._set_camera_words_text("")
+        self._refresh_camera_preview()
+        self._log(
+            f"Selected best camera frame for {reason}: "
+            f"score={quality.score:.0f}, sharpness={quality.sharpness:.0f}, "
+            f"contrast={quality.contrast:.1f}, brightness={quality.brightness:.1f}."
+        )
+        return self._captured_photo_frame.copy(), quality
 
+    def _capture_best_camera_frame(self):  # type: ignore[no-untyped-def]
+        frames = []
+        if self._latest_frame is not None:
+            frames.append(self._latest_frame.copy())
+
+        deadline = time.monotonic() + BEST_CAPTURE_TIMEOUT_SECONDS
+        while (
+            self._camera is not None
+            and len(frames) < BEST_CAPTURE_FRAME_COUNT
+            and time.monotonic() < deadline
+        ):
+            ok, frame = self._camera.read()
+            if ok:
+                self._latest_frame = frame
+                frames.append(frame.copy())
+            time.sleep(BEST_CAPTURE_FRAME_DELAY_SECONDS)
+
+        if not frames:
+            raise RuntimeError("Start the camera first.")
+
+        frame, quality = select_best_frame(frames)
+        return frame.copy(), quality
+
+    def capture_letters_from_camera(self) -> None:
         try:
             confidence_threshold = self._ocr_confidence_threshold()
-            source = "captured picture" if self._captured_photo_frame is not None else "camera"
+            if self._captured_photo_frame is None:
+                frame, quality = self._capture_best_photo_for_ocr("letter capture")
+                source = f"best camera frame (sharpness {quality.sharpness:.0f})"
+            else:
+                frame = self._captured_photo_frame.copy()
+                source = "captured picture"
             scan_token = self._next_camera_letter_scan_token()
             self._set_status(f"Capturing letters from the {source}...")
             self._log(f"Camera letter capture started from {source}.")
@@ -580,22 +622,28 @@ class ScrabblePlotterApp:
                 daemon=True,
             )
             thread.start()
+        except RuntimeError as exc:
+            if str(exc) == "Start the camera first.":
+                raise_user_error(str(exc))
+            else:
+                self._show_error(exc)
         except Exception as exc:
             self._show_error(exc)
 
     def identify_words_with_easyocr(self) -> None:
-        frame = self._current_camera_ocr_frame()
-        if frame is None:
-            raise_user_error("Start the camera first.")
-            return
         if self._camera_word_scan_running:
             self._set_status("EasyOCR word detection is already running.")
             return
 
         try:
             confidence_threshold = self._ocr_confidence_threshold()
+            if self._captured_photo_frame is None:
+                frame, quality = self._capture_best_photo_for_ocr("word detection")
+                source = f"best camera frame (sharpness {quality.sharpness:.0f})"
+            else:
+                frame = self._captured_photo_frame.copy()
+                source = "captured picture"
             self._camera_word_scan_running = True
-            source = "captured picture" if self._captured_photo_frame is not None else "camera"
             scan_token = self._next_camera_word_scan_token()
             self._set_status(f"Finding words in the {source} with EasyOCR...")
             self._set_camera_words_text("Finding words...")
@@ -606,6 +654,11 @@ class ScrabblePlotterApp:
                 daemon=True,
             )
             thread.start()
+        except RuntimeError as exc:
+            if str(exc) == "Start the camera first.":
+                raise_user_error(str(exc))
+            else:
+                self._show_error(exc)
         except Exception as exc:
             self._camera_word_scan_running = False
             self._show_error(exc)

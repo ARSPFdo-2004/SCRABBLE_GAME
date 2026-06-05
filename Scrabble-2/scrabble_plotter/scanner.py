@@ -243,6 +243,14 @@ class EasyOcrTextBox:
 PaddleOcrTextBox = EasyOcrTextBox
 
 
+@dataclass(frozen=True)
+class CameraFrameQuality:
+    score: float
+    sharpness: float
+    contrast: float
+    brightness: float
+
+
 def scan_image_file(
     image_path: str | Path,
     calibration: PlotterCalibration,
@@ -291,14 +299,57 @@ def scan_board_image(
     return BoardScanResult(cells=cells)
 
 
+def score_frame_quality(frame) -> CameraFrameQuality:  # type: ignore[no-untyped-def]
+    cv2 = _require_cv2()
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+    height, width = gray.shape[:2]
+    if height <= 0 or width <= 0:
+        return CameraFrameQuality(score=0.0, sharpness=0.0, contrast=0.0, brightness=0.0)
+
+    scale = min(1.0, 720.0 / float(max(width, height)))
+    if scale < 1.0:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    mean, stddev = cv2.meanStdDev(gray)
+    brightness = float(mean[0][0])
+    contrast = float(stddev[0][0])
+    brightness_factor = max(0.15, 1.0 - abs(brightness - 128.0) / 128.0)
+    contrast_factor = max(0.15, min(1.0, contrast / 64.0))
+    score = sharpness * (0.55 + 0.45 * brightness_factor) * (0.65 + 0.35 * contrast_factor)
+    return CameraFrameQuality(
+        score=float(score),
+        sharpness=sharpness,
+        contrast=contrast,
+        brightness=brightness,
+    )
+
+
+def select_best_frame(frames: list[Any]) -> tuple[Any, CameraFrameQuality]:
+    candidates: list[tuple[CameraFrameQuality, Any]] = []
+    for frame in frames:
+        if frame is None:
+            continue
+        candidates.append((score_frame_quality(frame), frame))
+    if not candidates:
+        raise ValueError("No camera frames were available to choose from.")
+    quality, frame = max(candidates, key=lambda item: item[0].score)
+    return frame, quality
+
+
 def scan_camera_letters(
     frame,
     confidence_threshold: float = 50.0,
     ocr_reader: EasyOcrReader | None = None,
 ) -> CameraLetterScanResult:  # type: ignore[no-untyped-def]
+    if ocr_reader is None:
+        tiles = detect_camera_tiles(frame, confidence_threshold=min(confidence_threshold, 15.0))
+        if tiles:
+            return CameraLetterScanResult(letters=captured_letters_from_camera_tiles(tiles))
+
     raw_result = ocr_reader(frame) if ocr_reader is not None else read_frame_with_easyocr(frame)
     boxes = parse_easyocr_text_boxes(raw_result, confidence_threshold=confidence_threshold)
-    boxes = filter_white_text_on_black_background(frame, boxes)
+    boxes = camera_character_text_boxes(frame, boxes)
     return CameraLetterScanResult(
         letters=captured_letters_from_text_boxes(boxes)
     )
@@ -309,12 +360,18 @@ def scan_camera_words(
     confidence_threshold: float = 50.0,
     ocr_reader: EasyOcrReader | None = None,
 ) -> CameraWordScanResult:  # type: ignore[no-untyped-def]
+    detected_tiles = (
+        detect_camera_tiles(frame, confidence_threshold=min(confidence_threshold, 15.0))
+        if ocr_reader is None
+        else []
+    )
     raw_result = ocr_reader(frame) if ocr_reader is not None else read_frame_with_easyocr(frame)
     boxes = parse_easyocr_text_boxes(raw_result, confidence_threshold=confidence_threshold)
-    boxes = filter_white_text_on_black_background(frame, boxes)
+    boxes = camera_character_text_boxes(frame, boxes)
+    text_box_tiles = camera_tiles_from_text_boxes(boxes)
     return CameraWordScanResult(
-        words=identify_directional_words(boxes),
-        tiles=camera_tiles_from_text_boxes(boxes),
+        words=_dedupe_camera_words(identify_directional_tile_words(detected_tiles) + identify_directional_words(boxes)),
+        tiles=detected_tiles or text_box_tiles,
         text_boxes=boxes,
     )
 
@@ -362,7 +419,45 @@ def detect_tile_corners(frame) -> list[list[tuple[float, float]]]:  # type: igno
             continue
         candidates.append((score, order_corners(quad)))
 
+    candidates.extend(_bright_tile_corner_candidates(frame))
     return _dedupe_tile_corners(candidates)
+
+
+def _bright_tile_corner_candidates(frame) -> list[tuple[float, list[tuple[float, float]]]]:  # type: ignore[no-untyped-def]
+    cv2 = _require_cv2()
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+    mask = cv2.inRange(gray, 120, 255)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    frame_area = float(frame.shape[0] * frame.shape[1])
+    minimum_area = max(180.0, frame_area * 0.0012)
+    maximum_area = max(minimum_area + 1.0, frame_area * 0.025)
+    candidates: list[tuple[float, list[tuple[float, float]]]] = []
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < minimum_area or area > maximum_area:
+            continue
+
+        x, y, width, height = cv2.boundingRect(contour)
+        if width <= 0 or height <= 0:
+            continue
+        aspect = min(width, height) / max(width, height)
+        fill = area / float(width * height)
+        if aspect < 0.65 or fill < 0.55:
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.035 * perimeter, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            quad = approx.reshape(4, 2)
+        else:
+            rect = cv2.minAreaRect(contour)
+            quad = cv2.boxPoints(rect)
+        candidates.append((area * aspect * fill, order_corners(quad)))
+
+    return candidates
 
 
 def warp_tile_image(frame, corners: list[tuple[float, float]], size_px: int = 96):  # type: ignore[no-untyped-def]
@@ -394,6 +489,21 @@ def captured_letters_from_text_boxes(text_boxes: list[EasyOcrTextBox]) -> list[C
     return sorted(letters, key=lambda letter: (letter.top, letter.left))
 
 
+def captured_letters_from_camera_tiles(tiles: list[CameraTile]) -> list[CapturedLetter]:
+    letters = [
+        CapturedLetter(
+            text=tile.letter,
+            confidence=tile.confidence,
+            left=int(round(tile.left)),
+            top=int(round(tile.top)),
+            width=max(1, int(round(tile.width))),
+            height=max(1, int(round(tile.height))),
+        )
+        for tile in tiles
+    ]
+    return sorted(letters, key=lambda letter: (letter.top, letter.left))
+
+
 def camera_tiles_from_text_boxes(text_boxes: list[EasyOcrTextBox]) -> list[CameraTile]:
     tiles = [
         CameraTile(letter=box.text, confidence=box.confidence, corners=box.points)
@@ -411,6 +521,11 @@ def filter_white_text_on_black_background(frame, text_boxes: list[EasyOcrTextBox
     ]
 
 
+def camera_character_text_boxes(frame, text_boxes: list[EasyOcrTextBox]) -> list[EasyOcrTextBox]:  # type: ignore[no-untyped-def]
+    white_on_black = filter_white_text_on_black_background(frame, text_boxes)
+    return white_on_black if white_on_black else text_boxes
+
+
 def read_tile_letter_with_easyocr(
     tile_image,
     ocr_reader: EasyOcrReader | None = None,
@@ -418,7 +533,7 @@ def read_tile_letter_with_easyocr(
     inner = _tile_inner_crop(tile_image)
     raw_result = ocr_reader(inner) if ocr_reader is not None else read_frame_with_easyocr(inner)
     boxes = parse_easyocr_text_boxes(raw_result, confidence_threshold=0.0)
-    boxes = filter_white_text_on_black_background(inner, boxes)
+    boxes = camera_character_text_boxes(inner, boxes)
     best_letter = ""
     best_confidence = 0.0
     best_score = 0.0
