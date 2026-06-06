@@ -18,6 +18,12 @@ BOARD_SIZE = 12
 EMPTY_CELL = "."
 
 
+def ensure_scrabble_package_path() -> None:
+    package_root = Path(__file__).resolve().parent / "Scrabble-2"
+    if package_root.exists() and str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Capture the best webcam frame and analyze it for characters with EasyOCR."
@@ -495,6 +501,35 @@ def format_matrix(matrix: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+def matched_words_from_matrix(matrix: list[list[str]] | None) -> list[Any]:
+    if matrix is None:
+        return []
+    try:
+        ensure_scrabble_package_path()
+        from scrabble_plotter.word_bank import matched_matrix_words
+    except Exception:
+        return []
+    return matched_matrix_words(matrix)
+
+
+def format_matched_words(words: list[Any]) -> str:
+    try:
+        ensure_scrabble_package_path()
+        from scrabble_plotter.word_bank import format_words_by_direction
+    except Exception:
+        return "No matching words found."
+    return format_words_by_direction(words)
+
+
+def words_for_overlay(words: list[Any], direction: str) -> str:
+    values = [
+        str(getattr(word, "word", "")).strip().upper()
+        for word in words
+        if getattr(word, "direction", "") == direction
+    ]
+    return ", ".join(value for value in values if value) or "-"
+
+
 def draw_detections(
     frame: Any,
     detections: list[dict[str, Any]],
@@ -547,13 +582,13 @@ def draw_live_overlay(
     message: str,
 ) -> Any:
     annotated = draw_detections(frame, detections, grid=grid)
-    words = tile_words_from_detections(detections)
-    word_text = ", ".join(word for word, _, _ in words)
+    matched_words = matched_words_from_matrix(matrix)
     character_text = " ".join(character for detection in detections for character in detection["text"])
     filled_cells = sum(1 for row in matrix or [] for cell in row if cell != EMPTY_CELL)
     lines = [
         "Live OCR: q/esc quit | space scan | s save",
-        f"Words: {word_text or '-'}",
+        f"Horizontal matches: {words_for_overlay(matched_words, 'horizontal_left_to_right')}",
+        f"Vertical matches: {words_for_overlay(matched_words, 'vertical_top_to_bottom')}",
         f"Characters: {character_text or '-'}",
         f"12x12 cells filled: {filled_cells}",
     ]
@@ -628,12 +663,12 @@ def run_live_camera(args: argparse.Namespace, threshold: float) -> int:
                 )
                 annotated = draw_detections(frame, detections, grid=grid)
                 cv2.imwrite(str(output_path), annotated)
-                words = tile_words_from_detections(detections)
-                summary = ", ".join(word for word, _, _ in words)
-                if not summary:
-                    summary = " ".join(detection["text"] for detection in detections) or "none"
+                matched_words = matched_words_from_matrix(matrix)
+                summary = ", ".join(str(getattr(word, "word", "")) for word in matched_words) or "none"
                 print("\n12x12 matrix:")
                 print(format_matrix(matrix))
+                print("\nMatched words:")
+                print(format_matched_words(matched_words))
                 with lock:
                     state["detections"] = detections
                     state["quality"] = quality
@@ -706,10 +741,12 @@ def print_detection_summary(
     if matrix is not None:
         print("12x12 matrix:")
         print(format_matrix(matrix))
+        print("\nMatched words:")
+        print(format_matched_words(matched_words_from_matrix(matrix)))
 
     tile_words = tile_words_from_detections(detections)
     if tile_words:
-        print("Detected words:")
+        print("Matched tile words:")
         for word, direction, confidence in tile_words:
             print(f"- {word} ({direction}, {confidence:.2f})")
 
@@ -724,10 +761,9 @@ def tile_words_from_detections(detections: list[dict[str, Any]]) -> list[tuple[s
     if not any(detection.get("variant") == "tile" for detection in detections):
         return []
     try:
-        package_root = Path(__file__).resolve().parent / "Scrabble-2"
-        if package_root.exists() and str(package_root) not in sys.path:
-            sys.path.insert(0, str(package_root))
+        ensure_scrabble_package_path()
         from scrabble_plotter.scanner import CameraTile, identify_directional_tile_words
+        from scrabble_plotter.word_bank import filter_matching_words
     except Exception:
         return []
 
@@ -740,9 +776,10 @@ def tile_words_from_detections(detections: list[dict[str, Any]]) -> list[tuple[s
         for detection in detections
         if detection.get("variant") == "tile" and str(detection.get("text", ""))
     ]
+    matched_words = filter_matching_words(identify_directional_tile_words(tiles))
     return [
         (word.word, word.direction_label, min(1.0, max(0.0, word.confidence / 100.0)))
-        for word in identify_directional_tile_words(tiles)
+        for word in matched_words
     ]
 
 

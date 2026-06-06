@@ -25,6 +25,7 @@ from .scanner import (
     scan_camera_words,
     select_best_frame,
 )
+from .word_bank import format_words_by_direction, matched_matrix_words
 from .scoring import (
     ScoreResult,
     normalize_letter,
@@ -292,12 +293,8 @@ class ScrabblePlotterApp:
         ttk.Label(scan_box, text="Captured Letters").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(scan_box, textvariable=self.captured_letters_var).grid(row=2, column=0, sticky="ew")
 
-        ttk.Label(scan_box, text="Detected Words").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        self.camera_words_text = tk.Text(scan_box, height=5, wrap="word", state="disabled")
-        self.camera_words_text.grid(row=4, column=0, sticky="ew")
-
         board_grid = ttk.Frame(scan_box)
-        board_grid.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        board_grid.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         for col in range(BOARD_SIZE):
             ttk.Label(board_grid, text=chr(ord("A") + col), width=3, anchor="center").grid(row=0, column=col + 1)
         self._letter_entries = []
@@ -318,6 +315,10 @@ class ScrabblePlotterApp:
                 entry.bind("<Return>", lambda event: self.calculate_score_from_board())
                 entry_row.append(entry)
             self._letter_entries.append(entry_row)
+
+        ttk.Label(scan_box, text="Matched Words").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.camera_words_text = tk.Text(scan_box, height=6, wrap="word", state="disabled")
+        self.camera_words_text.grid(row=5, column=0, sticky="ew")
 
         ttk.Label(scan_box, text="Blank Squares").grid(row=6, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(scan_box, textvariable=self.blank_squares_var).grid(row=7, column=0, sticky="ew")
@@ -673,12 +674,14 @@ class ScrabblePlotterApp:
         try:
             self._normalize_board_entries()
             calibration = self._calibration_from_form()
+            board_letters = self._board_letters_from_form()
             score = score_board(
-                self._board_letters_from_form(),
+                board_letters,
                 premium_layout=calibration.premium_layout,
                 blank_squares=self._blank_squares_from_form(),
             )
             self._handle_score_result(score)
+            self._set_camera_words_text(format_words_by_direction(matched_matrix_words(board_letters)))
         except Exception as exc:
             self._show_error(exc)
 
@@ -820,14 +823,14 @@ class ScrabblePlotterApp:
         self._set_camera_words_text(formatted_words)
         if scan.words:
             self._set_status(
-                f"EasyOCR found {len(scan.words)} matching word(s) from {len(scan.text_boxes)} text box(es)."
+                f"EasyOCR matched {len(scan.words)} word(s) from {len(scan.text_boxes)} text box(es)."
             )
             if announce:
-                self._log("Detected words:\n" + formatted_words)
+                self._log("Matched words:\n" + formatted_words)
         else:
-            self._set_status(f"EasyOCR found {len(scan.text_boxes)} text box(es), but no matching words.")
+            self._set_status(f"EasyOCR found {len(scan.text_boxes)} text box(es), but no words matched the list.")
             if announce:
-                self._log("Detected words: none")
+                self._log("Matched words: none")
         self._refresh_camera_preview()
 
     def _handle_camera_word_scan_error(
@@ -867,6 +870,7 @@ class ScrabblePlotterApp:
                 else:
                     entry.configure(bg="white")
         self.blank_squares_var.set("")
+        self._set_camera_words_text(format_words_by_direction(matched_matrix_words(scan.board_letters())))
         occupied = sum(1 for cell in scan.cells if cell.occupied)
         recognized = sum(1 for cell in scan.cells if cell.letter)
         if announce:
