@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import threading
 import time
@@ -14,7 +15,13 @@ import numpy as np
 
 
 DEFAULT_OUTPUT_PATH = "camera_ocr_result.jpg"
+DEFAULT_CORNERS_PATH = "board_corners.json"
+DEFAULT_CAPTURE_WIDTH = 1920
+DEFAULT_CAPTURE_HEIGHT = 1080
+DEFAULT_CAMERA_FOURCC = "MJPG"
 BOARD_SIZE = 12
+BOARD_OUTER_INCHES = 14.0
+TILE_HOLDER_INCHES = 1.0
 EMPTY_CELL = "."
 
 
@@ -25,12 +32,54 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-index", type=int, default=1, help="Camera index to open, usually 0.")
     parser.add_argument("--frames", type=int, default=24, help="Number of camera frames to sample.")
     parser.add_argument("--duration", type=float, default=1.5, help="Maximum capture time in seconds.")
-    parser.add_argument("--width", type=int, help="Optional camera capture width.")
-    parser.add_argument("--height", type=int, help="Optional camera capture height.")
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=DEFAULT_CAPTURE_WIDTH,
+        help="Camera capture width. Defaults to 1920 for 1080p capture.",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=DEFAULT_CAPTURE_HEIGHT,
+        help="Camera capture height. Defaults to 1080 for 1080p capture.",
+    )
+    parser.add_argument(
+        "--camera-fourcc",
+        default=DEFAULT_CAMERA_FOURCC,
+        help="Camera format code to request before setting resolution. Use '' to skip.",
+    )
+    parser.add_argument(
+        "--zoom-out",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Ask the camera driver for its widest/least-zoomed setting.",
+    )
+    parser.add_argument(
+        "--camera-zoom",
+        type=float,
+        help="Optional camera zoom value. Smaller values usually zoom out and override --zoom-out.",
+    )
     parser.add_argument("--threshold", type=float, default=0.10, help="Minimum OCR confidence from 0 to 1.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT_PATH, help="Annotated image output path.")
     parser.add_argument("--image", help="Analyze an existing image instead of opening the camera.")
     parser.add_argument("--grid-size", type=int, default=BOARD_SIZE, help="Board matrix size.")
+    parser.add_argument("--board-inches", type=float, default=BOARD_OUTER_INCHES, help="Outer board size in inches.")
+    parser.add_argument("--tile-inches", type=float, default=TILE_HOLDER_INCHES, help="Tile holder size in inches.")
+    parser.add_argument(
+        "--border-inches",
+        type=float,
+        help="Border size before the playable grid. Defaults to centered grid inside the board.",
+    )
+    parser.add_argument(
+        "--corners-file",
+        default=DEFAULT_CORNERS_PATH,
+        help="JSON file for manually calibrated board corners.",
+    )
+    parser.add_argument(
+        "--board-corners",
+        help="Manual 12x12 grid corners as x,y x,y x,y x,y. Order can be any corner order.",
+    )
     parser.add_argument("--live", action="store_true", help="Open a live camera preview with OCR overlay.")
     parser.add_argument(
         "--live-interval",
@@ -38,11 +87,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.5,
         help="Seconds between background OCR updates in live mode.",
     )
+    parser.add_argument("--preview-width", type=int, default=1920, help="Maximum live preview window width.")
+    parser.add_argument("--preview-height", type=int, default=1080, help="Maximum live preview window height.")
     parser.add_argument("--show", action="store_true", help="Show the annotated image in an OpenCV window.")
     return parser
 
 
-def open_camera(camera_index: int, width: int | None = None, height: int | None = None) -> Any:
+def open_camera(
+    camera_index: int,
+    width: int | None = None,
+    height: int | None = None,
+    camera_fourcc: str | None = DEFAULT_CAMERA_FOURCC,
+    zoom_out: bool = True,
+    camera_zoom: float | None = None,
+) -> Any:
     camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not camera.isOpened():
         camera.release()
@@ -50,10 +108,17 @@ def open_camera(camera_index: int, width: int | None = None, height: int | None 
     if not camera.isOpened():
         raise RuntimeError(f"Unable to open camera {camera_index}.")
 
+    fourcc = (camera_fourcc or "").strip()
+    if len(fourcc) == 4:
+        camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc.upper()))
     if width:
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     if height:
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if camera_zoom is not None:
+        camera.set(cv2.CAP_PROP_ZOOM, float(camera_zoom))
+    elif zoom_out:
+        camera.set(cv2.CAP_PROP_ZOOM, 0.0)
     return camera
 
 
@@ -63,8 +128,18 @@ def capture_best_frame(
     duration_seconds: float,
     width: int | None = None,
     height: int | None = None,
+    camera_fourcc: str | None = DEFAULT_CAMERA_FOURCC,
+    zoom_out: bool = True,
+    camera_zoom: float | None = None,
 ) -> tuple[Any, dict[str, float]]:
-    camera = open_camera(camera_index, width=width, height=height)
+    camera = open_camera(
+        camera_index,
+        width=width,
+        height=height,
+        camera_fourcc=camera_fourcc,
+        zoom_out=zoom_out,
+        camera_zoom=camera_zoom,
+    )
 
     try:
         best_frame = None
@@ -281,9 +356,23 @@ def best_frame_from_samples(frames: list[Any]) -> tuple[Any, dict[str, float]]:
     return max(candidates, key=lambda item: item[1]["score"])
 
 
+def board_layout_from_args(args: argparse.Namespace) -> tuple[float, float, float]:
+    board_inches = max(0.1, float(args.board_inches))
+    tile_inches = max(0.01, float(args.tile_inches))
+    grid_size = max(1, int(args.grid_size))
+    if args.border_inches is None:
+        border_inches = max(0.0, (board_inches - grid_size * tile_inches) / 2.0)
+    else:
+        border_inches = max(0.0, float(args.border_inches))
+    return board_inches, tile_inches, border_inches
+
+
 @dataclass(frozen=True)
 class FlexibleGrid:
     board_size: int
+    board_inches: float
+    tile_inches: float
+    border_inches: float
     corners: list[tuple[float, float]]
     image_to_grid: Any
     grid_to_image: Any
@@ -291,9 +380,14 @@ class FlexibleGrid:
     def map_point(self, x: float, y: float) -> tuple[int, int] | None:
         point = np.array([[[float(x), float(y)]]], dtype=np.float32)
         mapped = cv2.perspectiveTransform(point, self.image_to_grid)[0][0]
-        grid_x = float(mapped[0])
-        grid_y = float(mapped[1])
-        if grid_x < -0.15 or grid_y < -0.15 or grid_x > self.board_size + 0.15 or grid_y > self.board_size + 0.15:
+        board_x = float(mapped[0])
+        board_y = float(mapped[1])
+        grid_x = (board_x - self.border_inches) / self.tile_inches
+        grid_y = (board_y - self.border_inches) / self.tile_inches
+        tolerance = min(0.20, max(0.05, self.tile_inches * 0.15))
+        if grid_x < -tolerance or grid_y < -tolerance:
+            return None
+        if grid_x > self.board_size + tolerance or grid_y > self.board_size + tolerance:
             return None
         col = max(0, min(self.board_size - 1, int(grid_x)))
         row = max(0, min(self.board_size - 1, int(grid_y)))
@@ -304,10 +398,23 @@ def map_detections_to_matrix(
     frame: Any,
     detections: list[dict[str, Any]],
     board_size: int,
+    board_inches: float = BOARD_OUTER_INCHES,
+    tile_inches: float = TILE_HOLDER_INCHES,
+    border_inches: float | None = None,
+    manual_corners: list[tuple[float, float]] | None = None,
 ) -> tuple[list[list[str]], list[dict[str, Any]], FlexibleGrid | None]:
     matrix = [[EMPTY_CELL for _ in range(board_size)] for _ in range(board_size)]
     mapped = [dict(detection) for detection in detections]
-    grid = detect_flexible_grid(frame, board_size=board_size)
+    if border_inches is None:
+        border_inches = max(0.0, (board_inches - board_size * tile_inches) / 2.0)
+    grid = detect_flexible_grid(
+        frame,
+        board_size=board_size,
+        board_inches=board_inches,
+        tile_inches=tile_inches,
+        border_inches=border_inches,
+        manual_corners=manual_corners,
+    )
     if grid is None:
         return matrix, mapped, None
 
@@ -335,25 +442,61 @@ def map_detections_to_matrix(
     return matrix, mapped, grid
 
 
-def detect_flexible_grid(frame: Any, board_size: int) -> FlexibleGrid | None:
+def detect_flexible_grid(
+    frame: Any,
+    board_size: int,
+    board_inches: float,
+    tile_inches: float,
+    border_inches: float,
+    manual_corners: list[tuple[float, float]] | None = None,
+) -> FlexibleGrid | None:
+    corners = order_corners(manual_corners) if manual_corners and len(manual_corners) == 4 else None
+    if corners is not None:
+        return build_flexible_grid(
+            corners=corners,
+            board_size=board_size,
+            board_inches=float(board_size),
+            tile_inches=1.0,
+            border_inches=0.0,
+        )
+
     corners = detect_board_corners_from_dark_grid(frame)
     if corners is None:
         corners = detect_rectangular_board_corners(frame)
     if corners is None:
         return None
 
+    return build_flexible_grid(
+        corners=corners,
+        board_size=board_size,
+        board_inches=board_inches,
+        tile_inches=tile_inches,
+        border_inches=border_inches,
+    )
+
+
+def build_flexible_grid(
+    corners: list[tuple[float, float]],
+    board_size: int,
+    board_inches: float,
+    tile_inches: float,
+    border_inches: float,
+) -> FlexibleGrid:
     source = np.array(corners, dtype=np.float32)
     destination = np.array(
         [
             [0.0, 0.0],
-            [float(board_size), 0.0],
-            [float(board_size), float(board_size)],
-            [0.0, float(board_size)],
+            [float(board_inches), 0.0],
+            [float(board_inches), float(board_inches)],
+            [0.0, float(board_inches)],
         ],
         dtype=np.float32,
     )
     return FlexibleGrid(
         board_size=board_size,
+        board_inches=board_inches,
+        tile_inches=tile_inches,
+        border_inches=border_inches,
         corners=corners,
         image_to_grid=cv2.getPerspectiveTransform(source, destination),
         grid_to_image=cv2.getPerspectiveTransform(destination, source),
@@ -482,6 +625,40 @@ def distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
 
+def parse_corner_points(raw: str | None) -> list[tuple[float, float]] | None:
+    if not raw:
+        return None
+    points: list[tuple[float, float]] = []
+    for chunk in raw.replace(";", " ").split():
+        if "," not in chunk:
+            continue
+        x_text, y_text = chunk.split(",", 1)
+        points.append((float(x_text), float(y_text)))
+    if len(points) != 4:
+        raise ValueError("Board corners must contain exactly four x,y pairs.")
+    return order_corners(points)
+
+
+def load_corner_points(path: str | Path) -> list[tuple[float, float]] | None:
+    corner_path = Path(path)
+    if not corner_path.exists():
+        return None
+    payload = json.loads(corner_path.read_text(encoding="utf-8"))
+    raw_points = payload.get("corners") if isinstance(payload, dict) else payload
+    if not isinstance(raw_points, list) or len(raw_points) != 4:
+        return None
+    points = [(float(point[0]), float(point[1])) for point in raw_points]
+    return order_corners(points)
+
+
+def save_corner_points(path: str | Path, corners: list[tuple[float, float]]) -> None:
+    corner_path = Path(path)
+    payload = {
+        "corners": [[float(x), float(y)] for x, y in order_corners(corners)],
+    }
+    corner_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def detection_center(detection: dict[str, Any]) -> tuple[float, float]:
     left, top, right, bottom = box_bounds(detection["box"])
     return (left + right) / 2.0, (top + bottom) / 2.0
@@ -525,9 +702,23 @@ def draw_detections(
 
 
 def draw_board_grid(frame: Any, grid: FlexibleGrid) -> None:
+    outer = grid_points_to_image(
+        grid,
+        [
+            (0.0, 0.0),
+            (grid.board_inches, 0.0),
+            (grid.board_inches, grid.board_inches),
+            (0.0, grid.board_inches),
+        ],
+    )
+    cv2.polylines(frame, [np.array(outer, dtype=np.int32)], True, (255, 160, 0), 2, cv2.LINE_AA)
+
     for index in range(grid.board_size + 1):
-        vertical = grid_points_to_image(grid, [(float(index), 0.0), (float(index), float(grid.board_size))])
-        horizontal = grid_points_to_image(grid, [(0.0, float(index)), (float(grid.board_size), float(index))])
+        offset = grid.border_inches + index * grid.tile_inches
+        start = grid.border_inches
+        end = grid.border_inches + grid.board_size * grid.tile_inches
+        vertical = grid_points_to_image(grid, [(offset, start), (offset, end)])
+        horizontal = grid_points_to_image(grid, [(start, offset), (end, offset)])
         cv2.line(frame, vertical[0], vertical[1], (0, 180, 255), 1, cv2.LINE_AA)
         cv2.line(frame, horizontal[0], horizontal[1], (0, 180, 255), 1, cv2.LINE_AA)
 
@@ -538,6 +729,50 @@ def grid_points_to_image(grid: FlexibleGrid, points: list[tuple[float, float]]) 
     return [(int(round(point[0])), int(round(point[1]))) for point in transformed]
 
 
+def fit_frame_for_preview(
+    frame: Any,
+    max_width: int,
+    max_height: int,
+) -> tuple[Any, float]:
+    height, width = frame.shape[:2]
+    scale = min(
+        1.0,
+        max(1, int(max_width)) / float(max(1, width)),
+        max(1, int(max_height)) / float(max(1, height)),
+    )
+    if scale >= 0.999:
+        return frame, 1.0
+    resized = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    return resized, scale
+
+
+def scale_detections_for_preview(detections: list[dict[str, Any]], scale: float) -> list[dict[str, Any]]:
+    if abs(scale - 1.0) < 0.001:
+        return detections
+    scaled: list[dict[str, Any]] = []
+    for detection in detections:
+        copy = dict(detection)
+        copy["box"] = [
+            [float(point[0]) * scale, float(point[1]) * scale]
+            for point in detection["box"]
+        ]
+        scaled.append(copy)
+    return scaled
+
+
+def scale_grid_for_preview(grid: FlexibleGrid | None, scale: float) -> FlexibleGrid | None:
+    if grid is None or abs(scale - 1.0) < 0.001:
+        return grid
+    corners = [(x * scale, y * scale) for x, y in grid.corners]
+    return build_flexible_grid(
+        corners=corners,
+        board_size=grid.board_size,
+        board_inches=grid.board_inches,
+        tile_inches=grid.tile_inches,
+        border_inches=grid.border_inches,
+    )
+
+
 def draw_live_overlay(
     frame: Any,
     detections: list[dict[str, Any]],
@@ -545,18 +780,48 @@ def draw_live_overlay(
     matrix: list[list[str]] | None,
     grid: FlexibleGrid | None,
     message: str,
+    calibration_points: list[tuple[float, float]] | None = None,
+    preview_scale: float = 1.0,
+    source_size: tuple[int, int] | None = None,
 ) -> Any:
     annotated = draw_detections(frame, detections, grid=grid)
+    for index, point in enumerate(calibration_points or [], start=1):
+        center = (int(round(point[0])), int(round(point[1])))
+        cv2.circle(annotated, center, 6, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.putText(
+            annotated,
+            str(index),
+            (center[0] + 8, center[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
     words = tile_words_from_detections(detections)
     word_text = ", ".join(word for word, _, _ in words)
     character_text = " ".join(character for detection in detections for character in detection["text"])
     filled_cells = sum(1 for row in matrix or [] for cell in row if cell != EMPTY_CELL)
     lines = [
-        "Live OCR: q/esc quit | space scan | s save",
+        "Live OCR: q/esc quit | space scan | s save | c calibrate | r reset corners",
         f"Words: {word_text or '-'}",
         f"Characters: {character_text or '-'}",
         f"12x12 cells filled: {filled_cells}",
     ]
+    if source_size is None:
+        source_size = (frame.shape[1], frame.shape[0])
+    lines.append(
+        f"Camera: {source_size[0]}x{source_size[1]} | "
+        f"Preview: {frame.shape[1]}x{frame.shape[0]} scale {preview_scale:.2f}"
+    )
+    if grid is not None:
+        if grid.border_inches == 0 and grid.tile_inches == 1 and grid.board_inches == grid.board_size:
+            lines.append(f"Layout: manual {grid.board_size}x{grid.board_size} grid corners")
+        else:
+            lines.append(
+                f"Layout: {grid.board_inches:g}in board, "
+                f"{grid.tile_inches:g}in holders, {grid.border_inches:g}in border"
+            )
     if quality is not None:
         lines.append(
             f"Quality: sharpness {quality['sharpness']:.0f}, "
@@ -585,21 +850,60 @@ def draw_live_overlay(
 
 
 def run_live_camera(args: argparse.Namespace, threshold: float) -> int:
-    camera = open_camera(args.camera_index, width=args.width, height=args.height)
+    camera = open_camera(
+        args.camera_index,
+        width=args.width,
+        height=args.height,
+        camera_fourcc=args.camera_fourcc,
+        zoom_out=args.zoom_out,
+        camera_zoom=args.camera_zoom,
+    )
     reader = easyocr.Reader(["en"], gpu=False)
     output_path = Path(args.output)
+    corners_file = Path(args.corners_file)
+    board_inches, tile_inches, border_inches = board_layout_from_args(args)
     window_name = "Live Camera OCR"
     recent_frames: list[Any] = []
     lock = threading.Lock()
+    manual_corners = parse_corner_points(args.board_corners) or load_corner_points(corners_file)
+    preview_scale = 1.0
     state: dict[str, Any] = {
         "detections": [],
         "quality": None,
-        "message": "Aiming...",
+        "message": (
+            f"Loaded 12x12 grid corners from {corners_file.name}."
+            if manual_corners
+            else "Aiming... press C to click the 12x12 grid corners."
+        ),
         "running": False,
         "last_started_at": 0.0,
         "matrix": None,
         "grid": None,
+        "manual_corners": manual_corners,
+        "calibrating": False,
+        "calibration_points": [],
+        "preview_scale": preview_scale,
     }
+
+    def handle_mouse(event: int, x: int, y: int, flags: int, userdata: Any) -> None:
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        with lock:
+            if not state["calibrating"]:
+                return
+            scale = max(0.001, float(state.get("preview_scale", 1.0)))
+            points = list(state["calibration_points"])
+            points.append((float(x) / scale, float(y) / scale))
+            state["calibration_points"] = points
+            if len(points) < 4:
+                state["message"] = f"Calibration: click corner {len(points) + 1}/4."
+                return
+            corners = order_corners(points[:4])
+            state["manual_corners"] = corners
+            state["calibrating"] = False
+            state["calibration_points"] = []
+            save_corner_points(corners_file, corners)
+            state["message"] = f"12x12 grid corners saved to {corners_file.name}. Press Space to rescan."
 
     def start_ocr_scan(reason: str) -> None:
         with lock:
@@ -621,10 +925,16 @@ def run_live_camera(args: argparse.Namespace, threshold: float) -> int:
         def worker() -> None:
             try:
                 detections = analyze_characters(frame, threshold=threshold, reader=reader)
+                with lock:
+                    manual_corners = state["manual_corners"]
                 matrix, detections, grid = map_detections_to_matrix(
                     frame,
                     detections,
                     board_size=max(1, int(args.grid_size)),
+                    board_inches=board_inches,
+                    tile_inches=tile_inches,
+                    border_inches=border_inches,
+                    manual_corners=manual_corners,
                 )
                 annotated = draw_detections(frame, detections, grid=grid)
                 cv2.imwrite(str(output_path), annotated)
@@ -650,7 +960,9 @@ def run_live_camera(args: argparse.Namespace, threshold: float) -> int:
 
     try:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        print("Live camera started. Press Space to scan now, S to save, Q or Esc to quit.")
+        cv2.resizeWindow(window_name, max(1, int(args.preview_width)), max(1, int(args.preview_height)))
+        cv2.setMouseCallback(window_name, handle_mouse)
+        print("Live camera started. Press C, click the 4 playable-grid corners, then press Space to scan.")
         while True:
             ok, frame = camera.read()
             if not ok:
@@ -671,18 +983,58 @@ def run_live_camera(args: argparse.Namespace, threshold: float) -> int:
                 quality = state["quality"]
                 matrix = state["matrix"]
                 grid = state["grid"]
+                calibration_points = list(state["calibration_points"])
                 message = str(state["message"])
 
             if should_auto_scan:
                 start_ocr_scan("auto")
 
-            display = draw_live_overlay(frame, detections, quality, matrix, grid, message)
+            display_frame, preview_scale = fit_frame_for_preview(
+                frame,
+                max_width=args.preview_width,
+                max_height=args.preview_height,
+            )
+            source_size = (frame.shape[1], frame.shape[0])
+            display_detections = scale_detections_for_preview(detections, preview_scale)
+            display_grid = scale_grid_for_preview(grid, preview_scale)
+            display_calibration_points = [
+                (point[0] * preview_scale, point[1] * preview_scale)
+                for point in calibration_points
+            ]
+            with lock:
+                state["preview_scale"] = preview_scale
+
+            display = draw_live_overlay(
+                display_frame,
+                display_detections,
+                quality,
+                matrix,
+                display_grid,
+                message,
+                calibration_points=display_calibration_points,
+                preview_scale=preview_scale,
+                source_size=source_size,
+            )
             cv2.imshow(window_name, display)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")):
                 break
             if key == ord(" "):
                 start_ocr_scan("manual")
+            if key in (ord("c"), ord("C")):
+                with lock:
+                    state["calibrating"] = True
+                    state["calibration_points"] = []
+                    state["message"] = "Calibration: click corner 1/4."
+            if key in (ord("r"), ord("R")):
+                if corners_file.exists():
+                    corners_file.unlink()
+                with lock:
+                    state["manual_corners"] = None
+                    state["grid"] = None
+                    state["calibrating"] = False
+                    state["calibration_points"] = []
+                    state["message"] = "Manual board corners cleared."
             if key in (ord("s"), ord("S")):
                 cv2.imwrite(str(output_path), display)
                 with lock:
@@ -753,6 +1105,9 @@ def main() -> int:
     if args.live:
         return run_live_camera(args, threshold)
 
+    manual_corners = parse_corner_points(args.board_corners) or load_corner_points(args.corners_file)
+    board_inches, tile_inches, border_inches = board_layout_from_args(args)
+
     if args.image:
         frame = cv2.imread(str(Path(args.image)))
         if frame is None:
@@ -766,6 +1121,9 @@ def main() -> int:
             duration_seconds=args.duration,
             width=args.width,
             height=args.height,
+            camera_fourcc=args.camera_fourcc,
+            zoom_out=args.zoom_out,
+            camera_zoom=args.camera_zoom,
         )
         print(f"Captured best frame from camera {args.camera_index}.")
 
@@ -780,6 +1138,10 @@ def main() -> int:
         frame,
         detections,
         board_size=max(1, int(args.grid_size)),
+        board_inches=board_inches,
+        tile_inches=tile_inches,
+        border_inches=border_inches,
+        manual_corners=manual_corners,
     )
     print_detection_summary(detections, matrix=matrix)
 
