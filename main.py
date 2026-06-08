@@ -820,7 +820,6 @@ def draw_live_overlay(
     source_size: tuple[int, int] | None = None,
 ) -> Any:
     annotated = draw_detections(frame, detections, grid=grid)
-<<<<<<< HEAD
     for index, point in enumerate(calibration_points or [], start=1):
         center = (int(round(point[0])), int(round(point[1])))
         cv2.circle(annotated, center, 6, (0, 255, 255), -1, cv2.LINE_AA)
@@ -836,20 +835,14 @@ def draw_live_overlay(
         )
     words = tile_words_from_detections(detections)
     word_text = ", ".join(word for word, _, _ in words)
-    character_text = " ".join(character for detection in detections for character in detection["text"])
-    filled_cells = sum(1 for row in matrix or [] for cell in row if cell != EMPTY_CELL)
-    lines = [
-        "Live OCR: q/esc quit | space scan | s save | c calibrate | r reset corners",
-        f"Words: {word_text or '-'}",
-=======
     matched_words = matched_words_from_matrix(matrix)
     character_text = " ".join(character for detection in detections for character in detection["text"])
     filled_cells = sum(1 for row in matrix or [] for cell in row if cell != EMPTY_CELL)
     lines = [
-        "Live OCR: q/esc quit | space scan | s save",
+        "Live OCR: q/esc quit | space scan | s save | c calibrate | r reset corners",
+        f"Tile words: {word_text or '-'}",
         f"Horizontal matches: {words_for_overlay(matched_words, 'horizontal_left_to_right')}",
         f"Vertical matches: {words_for_overlay(matched_words, 'vertical_top_to_bottom')}",
->>>>>>> 53101cc44a0b88044d3ee5cca87989b2540b9be8
         f"Characters: {character_text or '-'}",
         f"12x12 cells filled: {filled_cells}",
     ]
