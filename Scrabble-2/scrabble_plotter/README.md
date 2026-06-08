@@ -48,9 +48,10 @@ the same `Reader(["en"], gpu=False).readtext(image)` approach as the
 setting and keeps only light/white lettering on dark/black backgrounds. It
 captures visible letter groups and assembles Scrabble words from detected word
 or letter positions. It lists only words that read horizontally from left to
-right or vertically from top to bottom. Common OCR confusions such as `0` for
-`O` and `1` or `|` for `I` are normalized. The first EasyOCR run may take
-longer while OCR models are loaded.
+right or vertically from top to bottom, then matches them against a generated
+1000-word reference list before displaying them. Common OCR confusions such as
+`0` for `O` and `1` or `|` for `I` are normalized. The first EasyOCR run may
+take longer while OCR models are loaded.
 
 The Gemini Agent panel is still available for optional plotter-action requests,
 but camera word detection does not need a Gemini API key.

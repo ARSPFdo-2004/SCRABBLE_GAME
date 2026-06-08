@@ -11,6 +11,13 @@ from typing import Any
 
 from .board import BOARD_SIZE, parse_square_label
 from .calibration import PlotterCalibration
+from .word_bank import (
+    DIRECTION_LABELS,
+    HORIZONTAL_LEFT_TO_RIGHT,
+    VERTICAL_TOP_TO_BOTTOM,
+    filter_matching_words,
+    format_words_by_direction,
+)
 
 
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -78,9 +85,7 @@ class GeminiDetectedWord:
 
     @property
     def direction_label(self) -> str:
-        if self.direction == "horizontal_right_to_left":
-            return "horizontal right-to-left"
-        return "vertical top-to-bottom"
+        return DIRECTION_LABELS.get(self.direction, self.direction)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -215,13 +220,13 @@ class GeminiPlotterAgent:
             "Identify complete words visible in the camera image. "
             "Do not return board coordinates or describe the board area. "
             "Only return words in these two orientations:\n"
-            "1. horizontal_right_to_left: read letters from right to left in the same row.\n"
+            "1. horizontal_left_to_right: read letters from left to right in the same row.\n"
             "2. vertical_top_to_bottom: read letters from top to bottom in the same column.\n"
-            "Ignore left-to-right horizontal words, bottom-to-top vertical words, diagonals, partial letters, "
+            "Ignore right-to-left horizontal words, bottom-to-top vertical words, diagonals, partial letters, "
             "and uncertain fragments. Use only uppercase A-Z letters. Prefer words of two or more letters.\n"
             "Confidence must be a number from 0 to 100.\n"
             "Return exactly one JSON object and no extra text, in this shape:\n"
-            '{"words":[{"word":"WORD","direction":"horizontal_right_to_left","confidence":85}]}\n'
+            '{"words":[{"word":"WORD","direction":"horizontal_left_to_right","confidence":85}]}\n'
             'If no words are visible, return {"words":[]}.\n'
             f"Local OCR captured these letters as extra context: {local_ocr}"
         )
@@ -275,18 +280,11 @@ def parse_detected_words(payload: dict[str, Any]) -> list[GeminiDetectedWord]:
             continue
         seen.add(key)
         words.append(detected)
-    return words
+    return filter_matching_words(words)
 
 
 def format_detected_words_numbered(words: list[GeminiDetectedWord]) -> str:
-    if not words:
-        return "No matching words found."
-
-    lines: list[str] = []
-    for index, detected in enumerate(words, start=1):
-        confidence = f" ({detected.confidence:.0f}%)" if detected.confidence > 0 else ""
-        lines.append(f"{index}. {detected.word} - {detected.direction_label}{confidence}")
-    return "\n".join(lines)
+    return format_words_by_direction(words)
 
 
 def _normalize_detected_word(value: Any) -> str:
@@ -299,12 +297,12 @@ def _normalize_detected_word(value: Any) -> str:
 def _normalize_word_direction(value: Any) -> str:
     normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
-        "horizontal_right_to_left": "horizontal_right_to_left",
-        "right_to_left": "horizontal_right_to_left",
-        "rtl": "horizontal_right_to_left",
-        "vertical_top_to_bottom": "vertical_top_to_bottom",
-        "top_to_bottom": "vertical_top_to_bottom",
-        "ttb": "vertical_top_to_bottom",
+        HORIZONTAL_LEFT_TO_RIGHT: HORIZONTAL_LEFT_TO_RIGHT,
+        "left_to_right": HORIZONTAL_LEFT_TO_RIGHT,
+        "ltr": HORIZONTAL_LEFT_TO_RIGHT,
+        VERTICAL_TOP_TO_BOTTOM: VERTICAL_TOP_TO_BOTTOM,
+        "top_to_bottom": VERTICAL_TOP_TO_BOTTOM,
+        "ttb": VERTICAL_TOP_TO_BOTTOM,
     }
     direction = aliases.get(normalized)
     if direction is None:

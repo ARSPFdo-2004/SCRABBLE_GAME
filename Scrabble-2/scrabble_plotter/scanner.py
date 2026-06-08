@@ -8,6 +8,13 @@ from typing import Any, Callable
 from .board import BOARD_SIZE
 from .calibration import PlotterCalibration
 from .scoring import normalize_letter, square_label
+from .word_bank import (
+    DIRECTION_LABELS,
+    HORIZONTAL_LEFT_TO_RIGHT,
+    VERTICAL_TOP_TO_BOTTOM,
+    filter_matching_words,
+    format_words_by_direction,
+)
 
 
 OcrReader = Callable[[Any, str], tuple[str, float]]
@@ -108,11 +115,7 @@ class CameraWord:
 
     @property
     def direction_label(self) -> str:
-        if self.direction == "horizontal_right_to_left":
-            return "horizontal right-to-left"
-        if self.direction == "horizontal_left_to_right":
-            return "horizontal left-to-right"
-        return "vertical top-to-bottom"
+        return DIRECTION_LABELS.get(self.direction, self.direction)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -369,8 +372,11 @@ def scan_camera_words(
     boxes = parse_easyocr_text_boxes(raw_result, confidence_threshold=confidence_threshold)
     boxes = camera_character_text_boxes(frame, boxes)
     text_box_tiles = camera_tiles_from_text_boxes(boxes)
+    detected_words = _dedupe_camera_words(
+        identify_directional_tile_words(detected_tiles) + identify_directional_words(boxes)
+    )
     return CameraWordScanResult(
-        words=_dedupe_camera_words(identify_directional_tile_words(detected_tiles) + identify_directional_words(boxes)),
+        words=filter_matching_words(detected_words),
         tiles=detected_tiles or text_box_tiles,
         text_boxes=boxes,
     )
@@ -609,9 +615,9 @@ def identify_directional_words(
         if len(box.text) < min_word_length:
             continue
         if _looks_vertical(box):
-            words.append(_camera_word_from_boxes(box.text, "vertical_top_to_bottom", [box]))
+            words.append(_camera_word_from_boxes(box.text, VERTICAL_TOP_TO_BOTTOM, [box]))
         else:
-            words.append(_camera_word_from_boxes(box.text, "horizontal_left_to_right", [box]))
+            words.append(_camera_word_from_boxes(box.text, HORIZONTAL_LEFT_TO_RIGHT, [box]))
 
     single_letter_boxes = [box for box in text_boxes if len(box.text) == 1]
     for run in _letter_runs(single_letter_boxes, line_axis="row"):
@@ -620,7 +626,7 @@ def identify_directional_words(
             words.append(
                 _camera_word_from_boxes(
                     "".join(box.text for box in ordered),
-                    "horizontal_left_to_right",
+                    HORIZONTAL_LEFT_TO_RIGHT,
                     ordered,
                 )
             )
@@ -630,7 +636,7 @@ def identify_directional_words(
             words.append(
                 _camera_word_from_boxes(
                     "".join(box.text for box in ordered),
-                    "vertical_top_to_bottom",
+                    VERTICAL_TOP_TO_BOTTOM,
                     ordered,
                 )
             )
@@ -650,7 +656,7 @@ def identify_directional_tile_words(
             words.append(
                 _camera_word_from_boxes(
                     "".join(tile.letter for tile in ordered),
-                    "horizontal_left_to_right",
+                    HORIZONTAL_LEFT_TO_RIGHT,
                     ordered,
                 )
             )
@@ -660,7 +666,7 @@ def identify_directional_tile_words(
             words.append(
                 _camera_word_from_boxes(
                     "".join(tile.letter for tile in ordered),
-                    "vertical_top_to_bottom",
+                    VERTICAL_TOP_TO_BOTTOM,
                     ordered,
                 )
             )
@@ -668,14 +674,7 @@ def identify_directional_tile_words(
 
 
 def format_camera_words_numbered(words: list[CameraWord]) -> str:
-    if not words:
-        return "No matching words found."
-
-    lines: list[str] = []
-    for index, detected in enumerate(words, start=1):
-        confidence = f" ({detected.confidence:.0f}%)" if detected.confidence > 0 else ""
-        lines.append(f"{index}. {detected.word} - {detected.direction_label}{confidence}")
-    return "\n".join(lines)
+    return format_words_by_direction(words)
 
 
 def parse_camera_letter_data(
@@ -1095,7 +1094,7 @@ def _dedupe_camera_words(words: list[CameraWord]) -> list[CameraWord]:
 
 
 def _direction_sort_rank(direction: str) -> int:
-    if direction in {"horizontal_left_to_right", "horizontal_right_to_left"}:
+    if direction == HORIZONTAL_LEFT_TO_RIGHT:
         return 0
     return 1
 

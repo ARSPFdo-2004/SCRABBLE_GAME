@@ -43,6 +43,11 @@ from scrabble_plotter.scanner import (
 )
 from scrabble_plotter.scoring import LETTER_VALUES, score_board, square_label
 from scrabble_plotter.serial_sender import format_move_command, format_reset_command, format_steps_command
+from scrabble_plotter.word_bank import (
+    generated_reference_word_set,
+    generated_reference_words,
+    matched_matrix_words,
+)
 
 
 class SquareParserTests(unittest.TestCase):
@@ -425,6 +430,39 @@ class ScannerTests(unittest.TestCase):
             ],
         )
 
+    def test_generated_reference_word_bank_contains_1000_words(self) -> None:
+        words = generated_reference_words()
+        bank = generated_reference_word_set()
+
+        self.assertEqual(len(words), 1000)
+        self.assertEqual(len(bank), 1000)
+        for word in ("CAT", "DOG", "OIL", "WORD", "TREE"):
+            with self.subTest(word=word):
+                self.assertIn(word, bank)
+        self.assertNotIn("ZZQ", bank)
+
+    def test_matrix_words_match_only_left_to_right_and_top_to_bottom(self) -> None:
+        matrix = [["" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        matrix[0][0] = "C"
+        matrix[0][1] = "A"
+        matrix[0][2] = "T"
+        matrix[0][5] = "Z"
+        matrix[0][6] = "Z"
+        matrix[0][7] = "Q"
+        matrix[1][4] = "D"
+        matrix[2][4] = "O"
+        matrix[3][4] = "G"
+
+        words = matched_matrix_words(matrix)
+
+        self.assertEqual(
+            [(word.word, word.direction, word.start_cell, word.end_cell) for word in words],
+            [
+                ("CAT", "horizontal_left_to_right", "A1", "C1"),
+                ("DOG", "vertical_top_to_bottom", "E2", "E4"),
+            ],
+        )
+
     def test_detect_tile_corners_finds_separate_tiles(self) -> None:
         image = _synthetic_tile_image(
             [
@@ -499,10 +537,24 @@ class ScannerTests(unittest.TestCase):
             ],
         )
 
+    def test_scan_camera_words_displays_only_reference_matches(self) -> None:
+        image = _synthetic_multi_word_white_on_black_text_image()
+
+        scan = scan_camera_words(
+            image,
+            confidence_threshold=50.0,
+            ocr_reader=lambda frame: [
+                _easyocr_result("CAT", 0.91, 18, 30, 85, 40),
+                _easyocr_result("ZZQ", 0.88, 138, 30, 80, 40),
+            ],
+        )
+
+        self.assertEqual([box.text for box in scan.text_boxes], ["CAT", "ZZQ"])
+        self.assertEqual([(word.word, word.direction) for word in scan.words], [("CAT", "horizontal_left_to_right")])
+
     def test_format_camera_words_as_numbered_list(self) -> None:
         text = format_camera_words_numbered(
             [
-                CameraWord("CAT", "horizontal_right_to_left", 92.0, 10, 20, 60, 24),
                 CameraWord("CAR", "horizontal_left_to_right", 91.0, 10, 60, 60, 24),
                 CameraWord("DOG", "vertical_top_to_bottom", 88.0, 150, 12, 20, 90),
             ]
@@ -510,9 +562,11 @@ class ScannerTests(unittest.TestCase):
 
         self.assertEqual(
             text,
-            "1. CAT - horizontal right-to-left (92%)\n"
-            "2. CAR - horizontal left-to-right (91%)\n"
-            "3. DOG - vertical top-to-bottom (88%)",
+            "Horizontal left-to-right:\n"
+            "1. CAR (91%)\n"
+            "\n"
+            "Vertical top-to-bottom:\n"
+            "1. DOG (88%)",
         )
 
     def test_detect_board_corners_finds_perspective_board_area(self) -> None:
@@ -602,9 +656,10 @@ class GeminiAgentTests(unittest.TestCase):
         words = parse_detected_words(
             {
                 "words": [
-                    {"word": "ta-c", "direction": "right to left", "confidence": 120},
+                    {"word": "cat", "direction": "left to right", "confidence": 120},
                     {"word": "do", "direction": "top-to-bottom", "confidence": 0.85},
-                    {"word": "ta-c", "direction": "horizontal_right_to_left", "confidence": 95},
+                    {"word": "cat", "direction": "horizontal_left_to_right", "confidence": 95},
+                    {"word": "ZZQ", "direction": "horizontal_left_to_right", "confidence": 90},
                     {"word": "A", "direction": "vertical_top_to_bottom", "confidence": 90},
                     {"word": "BAD", "direction": "diagonal", "confidence": 90},
                 ]
@@ -612,22 +667,25 @@ class GeminiAgentTests(unittest.TestCase):
         )
 
         self.assertEqual([(word.word, word.direction, word.confidence) for word in words], [
-            ("TAC", "horizontal_right_to_left", 100.0),
+            ("CAT", "horizontal_left_to_right", 100.0),
             ("DO", "vertical_top_to_bottom", 85.0),
         ])
 
     def test_format_detected_words_as_numbered_list(self) -> None:
         text = format_detected_words_numbered(
             [
-                GeminiDetectedWord("TAC", "horizontal_right_to_left", 92.0),
+                GeminiDetectedWord("CAT", "horizontal_left_to_right", 92.0),
                 GeminiDetectedWord("DOG", "vertical_top_to_bottom", 88.0),
             ]
         )
 
         self.assertEqual(
             text,
-            "1. TAC - horizontal right-to-left (92%)\n"
-            "2. DOG - vertical top-to-bottom (88%)",
+            "Horizontal left-to-right:\n"
+            "1. CAT (92%)\n"
+            "\n"
+            "Vertical top-to-bottom:\n"
+            "1. DOG (88%)",
         )
 
 
