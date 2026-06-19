@@ -1,0 +1,1672 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import unittest
+
+from scrabble_plotter.board import BOARD_SIZE, CELL_SIZE_MM, parse_square_label
+from scrabble_plotter.calibration import (
+    PREMIUM_DOUBLE_LETTER,
+    PREMIUM_DOUBLE_WORD,
+    PlotterCalibration,
+    path_for_storage,
+    resolve_stored_path,
+)
+from scrabble_plotter.camera import open_camera_capture, read_camera_frame
+from scrabble_plotter.gemini_agent import (
+    GeminiDetectedWord,
+    PlotterAgentAction,
+    _parse_json_object,
+    format_detected_words_numbered,
+    parse_detected_words,
+)
+from scrabble_plotter.gui import (
+    PICK_DROP_MAGNET_DELAY_MS,
+    PICK_DROP_MOVE_DELAY_MS,
+    PICK_DROP_Z_SETTLE_DELAY_MS,
+    ScrabblePlotterApp,
+    Z_DOWN_COMMAND,
+    Z_UP_COMMAND,
+)
+from scrabble_plotter.main import build_parser
+from scrabble_plotter.overlay import cell_label_positions, grid_segments, project_board_points
+from scrabble_plotter.scanner import (
+    CameraLetterScanResult,
+    CameraGridCell,
+    CameraOcrGrid,
+    CameraTile,
+    CameraWord,
+    CameraWordScanResult,
+    PaddleOcrTextBox,
+    board_square_from_image_point,
+    build_camera_ocr_grid,
+    detect_camera_tiles,
+    detect_board_corners,
+    detect_tile_corners,
+    format_camera_words_numbered,
+    identify_directional_words,
+    identify_directional_tile_words,
+    parse_camera_letter_data,
+    parse_easyocr_text_boxes,
+    parse_paddleocr_text_boxes,
+    parse_tesseract_data,
+    scan_board_image,
+    scan_camera_letters,
+    scan_camera_words,
+    score_frame_quality,
+    select_best_frame,
+)
+from scrabble_plotter.scoring import LETTER_VALUES, score_board, square_label
+from scrabble_plotter.serial_sender import (
+    BoardActuatorSender,
+    GCodeSender,
+    SerialConfig,
+    format_move_command,
+    format_reset_command,
+    format_steps_command,
+)
+from scrabble_plotter.word_bank import (
+    generated_reference_word_set,
+    generated_reference_words,
+    matched_matrix_words,
+)
+
+
+class SquareParserTests(unittest.TestCase):
+    def test_valid_labels(self) -> None:
+        examples = {
+            "A1": (0, 0, "A1"),
+            "a1": (0, 0, "A1"),
+            "H8": (7, 7, "H8"),
+            "L12": (11, 11, "L12"),
+        }
+
+        for raw, expected in examples.items():
+            with self.subTest(raw=raw):
+                square = parse_square_label(raw)
+                self.assertEqual((square.col, square.row, square.label), expected)
+
+    def test_invalid_labels(self) -> None:
+        for label in ("M1", "A0", "A13", "O15", "11A", ""):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                parse_square_label(label)
+
+
+class PlotterCalibrationTests(unittest.TestCase):
+    def test_fixed_coordinate_mapping_with_default_offset(self) -> None:
+        calibration = PlotterCalibration()
+
+        expected = {
+            "A1": (15.0, 15.0),
+            "A2": (15.0, 45.0),
+            "B1": (45.0, 15.0),
+            "L12": (345.0, 345.0),
+        }
+
+        for label, target in expected.items():
+            with self.subTest(label=label):
+                self.assertEqual(calibration.square_center_in_machine(parse_square_label(label)), target)
+
+    def test_fixed_coordinate_mapping_with_board_corner_offset(self) -> None:
+        calibration = PlotterCalibration(offset_x_mm=10.0, offset_y_mm=20.0)
+
+        self.assertEqual(calibration.square_center_in_machine(parse_square_label("A1")), (25.0, 35.0))
+        self.assertEqual(calibration.square_center_in_machine(parse_square_label("L12")), (355.0, 365.0))
+
+    def test_fixed_coordinate_mapping_with_custom_cell_size(self) -> None:
+        calibration = PlotterCalibration(offset_x_mm=10.0, offset_y_mm=20.0, cell_size_mm=25.0)
+
+        self.assertEqual(calibration.square_center_in_machine(parse_square_label("A1")), (22.5, 32.5))
+        self.assertEqual(calibration.square_center_in_machine(parse_square_label("A2")), (22.5, 57.5))
+
+    def test_persistence_round_trip(self) -> None:
+        calibration = PlotterCalibration(
+            camera_index=2,
+            offset_x_mm=12.5,
+            offset_y_mm=24.5,
+            cell_size_mm=25.0,
+            cart_x_mm=111.0,
+            cart_y_mm=222.0,
+            image_corners=[[0.0, 0.0], [360.0, 0.0], [360.0, 360.0], [0.0, 360.0]],
+        )
+
+        payload = json.loads(json.dumps(calibration.to_dict()))
+        loaded = PlotterCalibration.from_dict(payload)
+
+        self.assertEqual(loaded.board_size, BOARD_SIZE)
+        self.assertEqual(loaded.cell_size_mm, 25.0)
+        self.assertEqual(loaded.camera_index, 2)
+        self.assertEqual(loaded.offset_x_mm, 12.5)
+        self.assertEqual(loaded.offset_y_mm, 24.5)
+        self.assertEqual(loaded.x_steps_per_mm, 80.0)
+        self.assertEqual(loaded.y_steps_per_mm, 80.0)
+        self.assertEqual(loaded.cart_x_mm, 111.0)
+        self.assertEqual(loaded.cart_y_mm, 222.0)
+        self.assertEqual(len(loaded.image_corners), 4)
+
+    def test_persistence_round_trip_includes_step_settings(self) -> None:
+        calibration = PlotterCalibration(
+            x_steps_per_mm=100.0,
+            y_steps_per_mm=200.0,
+        )
+
+        payload = json.loads(json.dumps(calibration.to_dict()))
+        loaded = PlotterCalibration.from_dict(payload)
+
+        self.assertEqual(loaded.x_steps_per_mm, 100.0)
+        self.assertEqual(loaded.y_steps_per_mm, 200.0)
+
+    def test_persistence_round_trip_includes_scan_settings(self) -> None:
+        layout = [[PREMIUM_DOUBLE_WORD if row == col else "normal" for col in range(BOARD_SIZE)] for row in range(BOARD_SIZE)]
+        calibration = PlotterCalibration(
+            premium_layout=layout,
+            ocr_confidence_threshold=72.5,
+            ocr_cell_size_px=96,
+        )
+
+        payload = json.loads(json.dumps(calibration.to_dict()))
+        loaded = PlotterCalibration.from_dict(payload)
+
+        self.assertEqual(loaded.premium_layout[0][0], PREMIUM_DOUBLE_WORD)
+        self.assertEqual(loaded.premium_layout[1][0], "normal")
+        self.assertEqual(loaded.ocr_confidence_threshold, 72.5)
+        self.assertEqual(loaded.ocr_cell_size_px, 96)
+
+    def test_persistence_round_trip_includes_actuator_settings(self) -> None:
+        calibration = PlotterCalibration(
+            actuator_port="COM8",
+            actuator_baud=57600,
+            actuator_timeout=1.5,
+            actuator_countdown_seconds=45,
+        )
+
+        payload = json.loads(json.dumps(calibration.to_dict()))
+        loaded = PlotterCalibration.from_dict(payload)
+
+        self.assertEqual(loaded.actuator_port, "COM8")
+        self.assertEqual(loaded.actuator_baud, 57600)
+        self.assertEqual(loaded.actuator_timeout, 1.5)
+        self.assertEqual(loaded.actuator_countdown_seconds, 45)
+
+    def test_missing_scan_settings_default_for_old_calibration_files(self) -> None:
+        loaded = PlotterCalibration.from_dict({"board_size": BOARD_SIZE})
+
+        self.assertEqual(len(loaded.premium_layout), BOARD_SIZE)
+        self.assertEqual(len(loaded.premium_layout[0]), BOARD_SIZE)
+        self.assertEqual(loaded.ocr_confidence_threshold, 50.0)
+        self.assertEqual(loaded.ocr_cell_size_px, 80)
+        self.assertEqual(loaded.actuator_port, "")
+        self.assertEqual(loaded.actuator_baud, 115200)
+        self.assertEqual(loaded.actuator_timeout, 2.0)
+        self.assertEqual(loaded.actuator_countdown_seconds, 30)
+
+    def test_image_path_can_be_stored_relative_to_calibration_file(self) -> None:
+        calibration_path = Path("project/calibration/board.json")
+        image_path = Path("project/images/board.jpg")
+
+        stored_path = path_for_storage(image_path, calibration_path)
+
+        self.assertEqual(Path(stored_path), Path("../images/board.jpg"))
+        self.assertEqual(resolve_stored_path(stored_path, calibration_path), image_path.resolve())
+
+    def test_square_center_in_image_uses_camera_corners(self) -> None:
+        calibration = PlotterCalibration(
+            image_corners=[[0.0, 0.0], [360.0, 0.0], [360.0, 360.0], [0.0, 360.0]],
+        )
+
+        self.assertEqual(calibration.square_center_in_image(parse_square_label("A1")), (15.0, 15.0))
+        self.assertEqual(calibration.square_center_in_image(parse_square_label("L12")), (345.0, 345.0))
+
+    def test_cart_position_in_machine(self) -> None:
+        calibration = PlotterCalibration(cart_x_mm=90.0, cart_y_mm=140.0)
+
+        self.assertEqual(calibration.cart_position_in_machine(), (90.0, 140.0))
+
+
+class OverlayTests(unittest.TestCase):
+    def test_project_board_points(self) -> None:
+        corners = [(0.0, 0.0), (360.0, 0.0), (360.0, 360.0), (0.0, 360.0)]
+
+        points = project_board_points(corners, [(0.5, 0.5), (11.5, 11.5)])
+
+        self.assertEqual(points[0], (15.0, 15.0))
+        self.assertEqual(points[1], (345.0, 345.0))
+
+    def test_grid_segments_and_labels(self) -> None:
+        corners = [(0.0, 0.0), (360.0, 0.0), (360.0, 360.0), (0.0, 360.0)]
+
+        self.assertEqual(len(grid_segments(corners)), (BOARD_SIZE + 1) * 2)
+        labels = dict(cell_label_positions(corners))
+        self.assertEqual(labels["A1"], (15.0, 15.0))
+        self.assertEqual(labels["L12"], (345.0, 345.0))
+
+
+class GCodeFormattingTests(unittest.TestCase):
+    def test_gcode_formatting(self) -> None:
+        self.assertEqual(format_move_command(10.0, 20.5, 1500.0), "G0 X10 Y20.5 F1500")
+
+    def test_reset_command_formatting(self) -> None:
+        self.assertEqual(format_reset_command(), "HOMEZERO")
+
+    def test_steps_command_formatting(self) -> None:
+        self.assertEqual(format_steps_command(80.0, 100.5), "STEPS X80 Y100.5")
+
+
+class ScoringTests(unittest.TestCase):
+    def test_standard_letter_values(self) -> None:
+        self.assertEqual(LETTER_VALUES["A"], 1)
+        self.assertEqual(LETTER_VALUES["Z"], 10)
+
+    def test_scores_horizontal_and_vertical_words(self) -> None:
+        board = [["" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        board[0][0] = "C"
+        board[0][1] = "A"
+        board[0][2] = "T"
+        board[0][0] = "C"
+        board[1][0] = "A"
+        board[2][0] = "R"
+
+        result = score_board(board)
+        words = {word.word: word.score for word in result.words}
+
+        self.assertEqual(words["CAT"], 5)
+        self.assertEqual(words["CAR"], 5)
+        self.assertEqual(result.total_score, 10)
+
+    def test_applies_letter_and_word_premiums(self) -> None:
+        board = [["" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        board[0][0] = "Q"
+        board[0][1] = "I"
+
+        premiums = [["normal" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        premiums[0][0] = PREMIUM_DOUBLE_LETTER
+        premiums[0][1] = PREMIUM_DOUBLE_WORD
+
+        result = score_board(board, premium_layout=premiums)
+
+        self.assertEqual(result.words[0].word, "QI")
+        self.assertEqual(result.words[0].base_score, 21)
+        self.assertEqual(result.words[0].score, 42)
+
+    def test_blank_tiles_score_zero(self) -> None:
+        board = [["" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        board[0][0] = "Z"
+        board[0][1] = "A"
+
+        result = score_board(board, blank_squares={"A1"})
+
+        self.assertEqual(result.words[0].word, "ZA")
+        self.assertEqual(result.words[0].score, 1)
+
+
+class CameraTests(unittest.TestCase):
+    def test_read_camera_frame_retries_until_usable_frame(self) -> None:
+        frame = _FakeFrame()
+        camera = _FakeCapture(
+            reads=[
+                (False, None),
+                (True, _FakeFrame(shape=(0, 2, 3))),
+                (True, frame),
+            ]
+        )
+
+        self.assertIs(read_camera_frame(camera, attempts=3), frame)
+
+    def test_open_camera_capture_releases_backend_that_returns_no_frames(self) -> None:
+        bad_capture = _FakeCapture(reads=[(False, None), (False, None)])
+        good_frame = _FakeFrame()
+        good_capture = _FakeCapture(reads=[(True, good_frame)])
+        cv2 = _FakeCv2([bad_capture, good_capture])
+
+        result = open_camera_capture(
+            cv2,
+            2,
+            width=640,
+            height=480,
+            camera_fourcc="MJPG",
+            zoom_out=True,
+            warmup_attempts=2,
+            read_delay_seconds=0,
+            backend_candidates=[("bad", 10), ("good", 20)],
+        )
+
+        self.assertTrue(bad_capture.released)
+        self.assertIs(result.capture, good_capture)
+        self.assertEqual(result.backend_name, "good")
+        self.assertIs(result.first_frame, good_frame)
+        self.assertEqual(cv2.open_calls, [(2, 10), (2, 20)])
+        self.assertEqual(
+            good_capture.set_calls,
+            [
+                (1, 1234),
+                (2, 640),
+                (3, 480),
+                (4, 0.0),
+            ],
+        )
+
+    def test_open_camera_capture_reports_when_no_backend_returns_frames(self) -> None:
+        closed_capture = _FakeCapture(opened=False)
+        empty_capture = _FakeCapture(reads=[(False, None)])
+        cv2 = _FakeCv2([closed_capture, empty_capture])
+
+        with self.assertRaisesRegex(RuntimeError, "Unable to capture frames from camera 9"):
+            open_camera_capture(
+                cv2,
+                9,
+                warmup_attempts=1,
+                read_delay_seconds=0,
+                backend_candidates=[("closed", 10), ("empty", 20)],
+            )
+
+        self.assertTrue(closed_capture.released)
+        self.assertTrue(empty_capture.released)
+
+
+class ScannerTests(unittest.TestCase):
+    def test_tesseract_parser_chooses_best_letter(self) -> None:
+        letter, confidence = parse_tesseract_data({"text": ["", "B", "A"], "conf": ["-1", "42", "91"]})
+
+        self.assertEqual(letter, "A")
+        self.assertEqual(confidence, 91.0)
+
+    def test_camera_letter_parser_filters_and_scales_captured_letters(self) -> None:
+        letters = parse_camera_letter_data(
+            {
+                "text": ["cat", "3", "Z"],
+                "conf": ["82", "91", "49"],
+                "left": [20, 80, 120],
+                "top": [40, 100, 140],
+                "width": [60, 20, 30],
+                "height": [30, 20, 30],
+            },
+            confidence_threshold=50.0,
+            scale=2.0,
+        )
+
+        self.assertEqual(len(letters), 1)
+        self.assertEqual(letters[0].text, "CAT")
+        self.assertEqual((letters[0].left, letters[0].top, letters[0].width, letters[0].height), (10, 20, 30, 15))
+
+    def test_easyocr_parser_filters_text_boxes(self) -> None:
+        boxes = parse_easyocr_text_boxes(
+            [
+                _easyocr_result("ta-c", 0.91, 10, 20, 60, 24),
+                _easyocr_result("Z", 0.49, 100, 20, 30, 24),
+            ],
+            confidence_threshold=50.0,
+        )
+
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0].text, "TAC")
+        self.assertEqual(boxes[0].confidence, 91.0)
+        self.assertEqual((boxes[0].left, boxes[0].top, boxes[0].width, boxes[0].height), (10.0, 20.0, 60.0, 24.0))
+
+    def test_easyocr_parser_normalizes_o_and_i_confusions(self) -> None:
+        boxes = parse_easyocr_text_boxes(
+            [
+                _easyocr_result("0IL", 0.91, 10, 20, 60, 24),
+                _easyocr_result("1", 0.89, 100, 20, 14, 24),
+                _easyocr_result("|", 0.88, 130, 20, 10, 24),
+            ],
+            confidence_threshold=50.0,
+        )
+
+        self.assertEqual([box.text for box in boxes], ["OIL", "I", "I"])
+
+    def test_scan_camera_letters_uses_easyocr_reader(self) -> None:
+        image = _synthetic_white_on_black_text_image()
+
+        scan = scan_camera_letters(
+            image,
+            confidence_threshold=50.0,
+            ocr_reader=lambda frame: [
+                _easyocr_result("A", 0.82, 12, 92, 43, 38),
+                _easyocr_result("B", 0.91, 75, 92, 43, 38),
+            ],
+        )
+
+        self.assertEqual(scan.text(), "A")
+        self.assertEqual(len(scan.letters), 1)
+        self.assertEqual((scan.letters[0].left, scan.letters[0].top), (12, 92))
+
+    def test_scan_camera_letters_keeps_non_white_on_black_text_when_needed(self) -> None:
+        image = _synthetic_white_on_black_text_image()
+
+        scan = scan_camera_letters(
+            image,
+            confidence_threshold=50.0,
+            ocr_reader=lambda frame: [
+                _easyocr_result("B", 0.91, 75, 92, 43, 38),
+            ],
+        )
+
+        self.assertEqual(scan.text(), "B")
+        self.assertEqual(len(scan.letters), 1)
+
+    def test_frame_quality_prefers_sharp_text_frame(self) -> None:
+        cv2 = _require_cv2_for_tests()
+        sharp = _synthetic_white_on_black_text_image()
+        blurred = cv2.GaussianBlur(sharp, (21, 21), 0)
+
+        sharp_quality = score_frame_quality(sharp)
+        blurred_quality = score_frame_quality(blurred)
+        selected, selected_quality = select_best_frame([blurred, sharp])
+
+        self.assertGreater(sharp_quality.score, blurred_quality.score)
+        self.assertGreater(selected_quality.score, blurred_quality.score)
+        self.assertTrue((selected == sharp).all())
+
+    def test_paddleocr_v2_parser_filters_text_boxes(self) -> None:
+        boxes = parse_paddleocr_text_boxes(
+            [
+                [
+                    [[[10, 20], [70, 20], [70, 44], [10, 44]], ("ta-c", 0.91)],
+                    [[[100, 20], [130, 20], [130, 44], [100, 44]], ("Z", 0.49)],
+                ]
+            ],
+            confidence_threshold=50.0,
+        )
+
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0].text, "TAC")
+        self.assertEqual(boxes[0].confidence, 91.0)
+        self.assertEqual((boxes[0].left, boxes[0].top, boxes[0].width, boxes[0].height), (10.0, 20.0, 60.0, 24.0))
+
+    def test_paddleocr_v3_parser_reads_result_payload(self) -> None:
+        boxes = parse_paddleocr_text_boxes(
+            {
+                "res": {
+                    "rec_texts": ["DOG"],
+                    "rec_scores": [0.88],
+                    "rec_polys": [
+                        [[20, 10], [42, 10], [42, 120], [20, 120]],
+                    ],
+                }
+            },
+            confidence_threshold=50.0,
+        )
+
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0].text, "DOG")
+        self.assertEqual(boxes[0].confidence, 88.0)
+        self.assertEqual((boxes[0].left, boxes[0].top, boxes[0].width, boxes[0].height), (20.0, 10.0, 22.0, 110.0))
+
+    def test_identifies_left_to_right_and_top_to_bottom_letter_runs(self) -> None:
+        boxes = [
+            _paddle_box("C", 92, 12, 20),
+            _paddle_box("A", 88, 42, 20),
+            _paddle_box("T", 86, 72, 20),
+            _ocr_box("O", 90, 12, 92, 22, 22),
+            _ocr_box("I", 88, 46, 92, 6, 22),
+            _ocr_box("L", 87, 70, 92, 20, 22),
+            _paddle_box("D", 94, 150, 12),
+            _paddle_box("O", 90, 150, 42),
+            _paddle_box("G", 89, 150, 72),
+        ]
+
+        words = identify_directional_words(boxes)
+
+        self.assertEqual(
+            [(word.word, word.direction) for word in words],
+            [
+                ("CAT", "horizontal_left_to_right"),
+                ("OIL", "horizontal_left_to_right"),
+                ("DOG", "vertical_top_to_bottom"),
+            ],
+        )
+
+    def test_identifies_words_from_individual_tiles(self) -> None:
+        tiles = [
+            _camera_tile("C", 92, 12, 20),
+            _camera_tile("A", 88, 42, 20),
+            _camera_tile("T", 86, 72, 20),
+            _camera_tile("D", 94, 150, 12),
+            _camera_tile("O", 90, 150, 42),
+            _camera_tile("G", 89, 150, 72),
+        ]
+
+        words = identify_directional_tile_words(tiles)
+
+        self.assertEqual(
+            [(word.word, word.direction) for word in words],
+            [
+                ("CAT", "horizontal_left_to_right"),
+                ("DOG", "vertical_top_to_bottom"),
+            ],
+        )
+
+    def test_generated_reference_word_bank_contains_1000_words(self) -> None:
+        words = generated_reference_words()
+        bank = generated_reference_word_set()
+
+        self.assertEqual(len(words), 1000)
+        self.assertEqual(len(bank), 1000)
+        for word in ("CAT", "DOG", "OIL", "WORD", "TREE"):
+            with self.subTest(word=word):
+                self.assertIn(word, bank)
+        self.assertNotIn("ZZQ", bank)
+
+    def test_matrix_words_match_only_left_to_right_and_top_to_bottom(self) -> None:
+        matrix = [["" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        matrix[0][0] = "C"
+        matrix[0][1] = "A"
+        matrix[0][2] = "T"
+        matrix[0][5] = "Z"
+        matrix[0][6] = "Z"
+        matrix[0][7] = "Q"
+        matrix[1][4] = "D"
+        matrix[2][4] = "O"
+        matrix[3][4] = "G"
+
+        words = matched_matrix_words(matrix)
+
+        self.assertEqual(
+            [(word.word, word.direction, word.start_cell, word.end_cell) for word in words],
+            [
+                ("CAT", "horizontal_left_to_right", "A1", "C1"),
+                ("DOG", "vertical_top_to_bottom", "E2", "E4"),
+            ],
+        )
+
+    def test_detect_tile_corners_finds_separate_tiles(self) -> None:
+        image = _synthetic_tile_image(
+            [
+                ("", 20, 30),
+                ("", 80, 30),
+                ("", 140, 30),
+            ]
+        )
+
+        corners = detect_tile_corners(image)
+
+        self.assertEqual(len(corners), 3)
+        centers = [(round(sum(point[0] for point in tile) / 4), round(sum(point[1] for point in tile) / 4)) for tile in corners]
+        self.assertEqual(centers, [(40, 50), (100, 50), (160, 50)])
+
+    def test_detect_camera_tiles_reads_letter_inside_each_tile(self) -> None:
+        image = _synthetic_dark_tile_image(
+            [
+                ("T", 20, 30),
+                ("A", 80, 30),
+                ("C", 140, 30),
+            ]
+        )
+        letters = iter(["T", "A", "C"])
+
+        tiles = detect_camera_tiles(
+            image,
+            confidence_threshold=50.0,
+            ocr_reader=lambda crop: [_easyocr_result(next(letters), 0.91, 0, 0, 68, 68)],
+        )
+
+        self.assertEqual([tile.letter for tile in tiles], ["T", "A", "C"])
+
+    def test_detect_camera_tiles_reads_light_tiles_on_dark_board(self) -> None:
+        image = _synthetic_light_tile_board_image(
+            [
+                ("C", 20, 30),
+                ("A", 80, 30),
+                ("T", 140, 30),
+            ]
+        )
+        letters = iter(["C", "A", "T"])
+
+        tiles = detect_camera_tiles(
+            image,
+            confidence_threshold=50.0,
+            ocr_reader=lambda crop: [_easyocr_result(next(letters), 0.91, 0, 0, 68, 68)],
+        )
+
+        self.assertEqual([tile.letter for tile in tiles], ["C", "A", "T"])
+
+    def test_scan_camera_words_uses_easyocr_reader(self) -> None:
+        image = _synthetic_multi_word_white_on_black_text_image()
+
+        scan = scan_camera_words(
+            image,
+            confidence_threshold=50.0,
+            ocr_reader=lambda frame: [
+                _easyocr_result("CAT", 0.91, 18, 30, 85, 40),
+                _easyocr_result("0IL", 0.88, 138, 30, 80, 40),
+                _easyocr_result("DOG", 0.90, 20, 98, 90, 38),
+            ],
+        )
+
+        self.assertEqual(scan.tiles, [])
+        self.assertEqual([box.text for box in scan.text_boxes], ["CAT", "OIL"])
+        self.assertEqual(
+            [(word.word, word.direction) for word in scan.words],
+            [
+                ("CAT", "horizontal_left_to_right"),
+                ("OIL", "horizontal_left_to_right"),
+            ],
+        )
+
+    def test_scan_camera_words_displays_only_reference_matches(self) -> None:
+        image = _synthetic_multi_word_white_on_black_text_image()
+
+        scan = scan_camera_words(
+            image,
+            confidence_threshold=50.0,
+            ocr_reader=lambda frame: [
+                _easyocr_result("CAT", 0.91, 18, 30, 85, 40),
+                _easyocr_result("ZZQ", 0.88, 138, 30, 80, 40),
+            ],
+        )
+
+        self.assertEqual([box.text for box in scan.text_boxes], ["CAT", "ZZQ"])
+        self.assertEqual([(word.word, word.direction) for word in scan.words], [("CAT", "horizontal_left_to_right")])
+
+    def test_format_camera_words_as_numbered_list(self) -> None:
+        text = format_camera_words_numbered(
+            [
+                CameraWord("CAR", "horizontal_left_to_right", 91.0, 10, 60, 60, 24),
+                CameraWord("DOG", "vertical_top_to_bottom", 88.0, 150, 12, 20, 90),
+            ]
+        )
+
+        self.assertEqual(
+            text,
+            "Horizontal left-to-right:\n"
+            "1. CAR (91%)\n"
+            "\n"
+            "Vertical top-to-bottom:\n"
+            "1. DOG (88%)",
+        )
+
+    def test_detect_board_corners_finds_perspective_board_area(self) -> None:
+        image, expected = _synthetic_camera_board_image()
+
+        corners = detect_board_corners(image)
+
+        self.assertEqual(len(corners), 4)
+        for actual, target in zip(corners, expected):
+            self.assertAlmostEqual(actual[0], target[0], delta=10.0)
+            self.assertAlmostEqual(actual[1], target[1], delta=10.0)
+
+    def test_camera_ocr_grid_maps_tiles_to_board_cells(self) -> None:
+        image, board_corners = _synthetic_camera_board_image()
+        tile_corners = project_board_points(
+            board_corners,
+            [(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)],
+        )
+        tile = CameraTile("A", 91.0, tile_corners)
+
+        grid = build_camera_ocr_grid(image, tiles=[tile])
+
+        self.assertIsNotNone(grid)
+        assert grid is not None
+        self.assertEqual(grid.board_letters()[0][0], "A")
+
+    def test_camera_ocr_grid_splits_word_box_across_cells(self) -> None:
+        image, board_corners = _synthetic_camera_board_image()
+        word_points = project_board_points(
+            board_corners,
+            [(0.1, 0.2), (2.9, 0.2), (2.9, 0.8), (0.1, 0.8)],
+        )
+
+        grid = build_camera_ocr_grid(
+            image,
+            text_boxes=[PaddleOcrTextBox("CAT", 91.0, word_points)],
+        )
+
+        self.assertIsNotNone(grid)
+        assert grid is not None
+        self.assertEqual(grid.board_letters()[0][:3], ["C", "A", "T"])
+
+    def test_board_square_from_image_point_maps_detected_grid_click(self) -> None:
+        _, board_corners = _synthetic_camera_board_image()
+        a1_center, l12_center = project_board_points(
+            board_corners,
+            [(0.5, 0.5), (11.5, 11.5)],
+        )
+
+        self.assertEqual(board_square_from_image_point(board_corners, *a1_center), "A1")
+        self.assertEqual(board_square_from_image_point(board_corners, *l12_center), "L12")
+        self.assertIsNone(board_square_from_image_point(board_corners, 10.0, 10.0))
+
+    def test_scan_camera_words_returns_board_aligned_grid(self) -> None:
+        image, board_corners = _synthetic_camera_board_image()
+        word_points = project_board_points(
+            board_corners,
+            [(0.1, 0.2), (2.9, 0.2), (2.9, 0.8), (0.1, 0.8)],
+        )
+
+        scan = scan_camera_words(
+            image,
+            confidence_threshold=50.0,
+            ocr_reader=lambda frame: [[[[x, y] for x, y in word_points], "CAT", 0.91]],
+        )
+
+        self.assertEqual([(word.word, word.direction) for word in scan.words], [("CAT", "horizontal_left_to_right")])
+        self.assertIsNotNone(scan.grid)
+        assert scan.grid is not None
+        self.assertEqual(scan.grid.board_letters()[0][:3], ["C", "A", "T"])
+
+    def test_scan_uses_mocked_ocr_and_confidence_threshold(self) -> None:
+        cv2 = _require_cv2_for_tests()
+        cell_size = 40
+        image = _synthetic_board_image(cell_size, {"A1": "A"})
+        calibration = PlotterCalibration(
+            image_corners=[
+                [0.0, 0.0],
+                [float(BOARD_SIZE * cell_size), 0.0],
+                [float(BOARD_SIZE * cell_size), float(BOARD_SIZE * cell_size)],
+                [0.0, float(BOARD_SIZE * cell_size)],
+            ],
+            ocr_cell_size_px=cell_size,
+            ocr_confidence_threshold=50.0,
+        )
+
+        scan = scan_board_image(image, calibration, ocr_reader=lambda crop, square: ("A", 49.0))
+        cells = {cell.square: cell for cell in scan.cells}
+
+        self.assertTrue(cells["A1"].occupied)
+        self.assertEqual(cells["A1"].letter, "")
+        self.assertFalse(cells["B1"].occupied)
+
+    def test_scan_grid_orientation_maps_a1_and_l12(self) -> None:
+        cell_size = 40
+        image = _synthetic_board_image(cell_size, {"A1": "A", "L12": "Z"})
+        calibration = PlotterCalibration(
+            image_corners=[
+                [0.0, 0.0],
+                [float(BOARD_SIZE * cell_size), 0.0],
+                [float(BOARD_SIZE * cell_size), float(BOARD_SIZE * cell_size)],
+                [0.0, float(BOARD_SIZE * cell_size)],
+            ],
+            ocr_cell_size_px=cell_size,
+            ocr_confidence_threshold=50.0,
+        )
+
+        scan = scan_board_image(
+            image,
+            calibration,
+            ocr_reader=lambda crop, square: ({"A1": "A", "L12": "Z"}.get(square, ""), 99.0),
+        )
+        board = scan.board_letters()
+
+        self.assertEqual(board[0][0], "A")
+        self.assertEqual(board[11][11], "Z")
+        self.assertEqual(square_label(11, 11), "L12")
+
+
+class GeminiAgentTests(unittest.TestCase):
+    def test_agent_action_accepts_valid_square(self) -> None:
+        action = PlotterAgentAction.from_payload(
+            {"action": "move_square", "square": "a1", "reason": "target selected"}
+        )
+
+        self.assertEqual(action.action, "move_square")
+        self.assertEqual(action.square, "A1")
+
+    def test_agent_action_rejects_invalid_square(self) -> None:
+        with self.assertRaises(ValueError):
+            PlotterAgentAction.from_payload({"action": "move_square", "square": "M1"})
+
+    def test_agent_action_accepts_cart_reset_and_none(self) -> None:
+        for raw in ("go_cart", "reset", "none"):
+            with self.subTest(action=raw):
+                action = PlotterAgentAction.from_payload({"action": raw, "square": "A1"})
+                self.assertEqual(action.action, raw)
+                self.assertIsNone(action.square)
+
+    def test_json_parser_handles_code_fence(self) -> None:
+        payload = _parse_json_object('```json\n{"action":"go_cart","reason":"done"}\n```')
+
+        self.assertEqual(payload["action"], "go_cart")
+
+    def test_parse_detected_words_normalizes_and_filters_results(self) -> None:
+        words = parse_detected_words(
+            {
+                "words": [
+                    {"word": "cat", "direction": "left to right", "confidence": 120},
+                    {"word": "do", "direction": "top-to-bottom", "confidence": 0.85},
+                    {"word": "cat", "direction": "horizontal_left_to_right", "confidence": 95},
+                    {"word": "ZZQ", "direction": "horizontal_left_to_right", "confidence": 90},
+                    {"word": "A", "direction": "vertical_top_to_bottom", "confidence": 90},
+                    {"word": "BAD", "direction": "diagonal", "confidence": 90},
+                ]
+            }
+        )
+
+        self.assertEqual([(word.word, word.direction, word.confidence) for word in words], [
+            ("CAT", "horizontal_left_to_right", 100.0),
+            ("DO", "vertical_top_to_bottom", 85.0),
+        ])
+
+    def test_format_detected_words_as_numbered_list(self) -> None:
+        text = format_detected_words_numbered(
+            [
+                GeminiDetectedWord("CAT", "horizontal_left_to_right", 92.0),
+                GeminiDetectedWord("DOG", "vertical_top_to_bottom", 88.0),
+            ]
+        )
+
+        self.assertEqual(
+            text,
+            "Horizontal left-to-right:\n"
+            "1. CAT (92%)\n"
+            "\n"
+            "Vertical top-to-bottom:\n"
+            "1. DOG (88%)",
+        )
+
+
+class CliTests(unittest.TestCase):
+    def test_gui_command_exists(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["gui"])
+        self.assertEqual(args.command, "gui")
+
+    def test_scan_image_command_exists(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["scan-image", "--image", "board.jpg", "--calibration", "board.json"])
+        self.assertEqual(args.command, "scan-image")
+        self.assertEqual(args.image, "board.jpg")
+        self.assertEqual(args.calibration, "board.json")
+
+    def test_set_offset_command_exists(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["set-offset", "--calibration", "board.json", "--x", "10", "--y", "20"])
+        self.assertEqual(args.command, "set-offset")
+        self.assertEqual(args.x, 10.0)
+        self.assertEqual(args.y, 20.0)
+
+    def test_move_gcode_command_does_not_replace_subcommand(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "move",
+                "--calibration",
+                "board.json",
+                "--square",
+                "A1",
+                "--port",
+                "COM3",
+                "--command",
+                "G1",
+                "--dry-run",
+            ]
+        )
+        self.assertEqual(args.command, "move")
+        self.assertEqual(args.gcode_command, "G1")
+
+
+class _FakeSerialConnection:
+    def __init__(self, responses: list[str]):
+        self.responses = list(responses)
+        self.writes: list[str] = []
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data.decode("utf-8"))
+
+    def flush(self) -> None:
+        pass
+
+    def readline(self) -> bytes:
+        if not self.responses:
+            return b""
+        return self.responses.pop(0).encode("utf-8")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeVar:
+    def __init__(self, value: str):
+        self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+    def set(self, value: object) -> None:
+        self.value = str(value)
+
+
+class PickDropTests(unittest.TestCase):
+    def test_pick_and_drop_runs_requested_order_from_rack_to_board(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.statuses = []
+        app.logs = []
+        app.calls = []
+        app.delays = []
+
+        class ImmediateRoot:
+            def after(self, delay, callback):  # type: ignore[no-untyped-def]
+                app.delays.append(delay)
+                callback()
+
+        app.root = ImmediateRoot()
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+        app._show_error = lambda exc: (_ for _ in ()).throw(exc)
+        app._send_pick_drop_ordered_command = lambda command: app.calls.append(("command", command))
+        app._send_pick_drop_ordered_target_move = lambda target: app.calls.append(("move", target))
+
+        ScrabblePlotterApp._pick_and_drop_targets(app, "TR1", "H8")
+
+        self.assertEqual(
+            app.calls,
+            [
+                ("command", Z_UP_COMMAND),
+                ("move", "TR1"),
+                ("command", Z_DOWN_COMMAND),
+                ("command", "M1"),
+                ("command", Z_UP_COMMAND),
+                ("move", "H8"),
+                ("command", Z_DOWN_COMMAND),
+                ("command", "M0"),
+                ("command", Z_UP_COMMAND),
+            ],
+        )
+        self.assertEqual(app.statuses[-1], "Picked current tile and dropped on H8.")
+        self.assertEqual(app.delays[0], PICK_DROP_Z_SETTLE_DELAY_MS)
+        self.assertEqual(app.delays[1], PICK_DROP_MOVE_DELAY_MS)
+        self.assertEqual(app.delays[3], PICK_DROP_MAGNET_DELAY_MS)
+        self.assertEqual(app.delays[6], PICK_DROP_Z_SETTLE_DELAY_MS)
+        self.assertEqual(app.delays[7], PICK_DROP_MAGNET_DELAY_MS)
+
+    def test_pick_and_drop_accepts_board_pickup_and_rejects_bad_targets(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+
+        ScrabblePlotterApp._validate_pick_drop_targets(app, "A1", "H8")
+        ScrabblePlotterApp._validate_pick_drop_targets(app, "TR7", "H8")
+
+        with self.assertRaises(ValueError):
+            ScrabblePlotterApp._validate_pick_drop_targets(app, "TR8", "H8")
+        with self.assertRaises(ValueError):
+            ScrabblePlotterApp._validate_pick_drop_targets(app, "TR1", "TR2")
+
+    def test_pick_and_drop_applies_current_z_height_before_sequence(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.pick_square_var = _FakeVar("TR1")
+        app.drop_square_var = _FakeVar("H8")
+        app.z_height_angle = _FakeVar("120")
+        app.calls = []
+        app._send_pick_drop_aux_command = lambda command: app.calls.append(("aux", command))
+        app._pick_and_drop_targets = lambda pickup, drop: app.calls.append(("pick_drop", pickup, drop))
+        app._show_error = lambda exc: (_ for _ in ()).throw(exc)
+
+        ScrabblePlotterApp.pick_and_drop(app)
+
+        self.assertEqual(app.calls, [("aux", "ZH120"), ("pick_drop", "TR1", "H8")])
+
+    def test_pick_and_drop_rejects_overlapping_sequence(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._pick_drop_running = True
+        app.pick_square_var = _FakeVar("TR1")
+        app.drop_square_var = _FakeVar("H8")
+        app.errors = []
+        app._show_error = app.errors.append
+
+        ScrabblePlotterApp.pick_and_drop(app)
+
+        self.assertEqual(len(app.errors), 1)
+        self.assertIn("already running", str(app.errors[0]))
+
+    def test_pick_drop_auxiliary_commands_do_not_use_rack_move_sender(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.calls = []
+        app._send_tile_rack_move_command = lambda command: app.calls.append(("rack", command))
+        app._send_pick_drop_aux_command = lambda command: app.calls.append(("aux", command))
+
+        ScrabblePlotterApp._send_pick_drop_ordered_command(app, "ZU")
+
+        self.assertEqual(app.calls, [("aux", "ZU")])
+
+
+class SerialSenderTests(unittest.TestCase):
+    def test_auxiliary_command_can_reuse_open_connection_without_startup_g90(self) -> None:
+        connection = _FakeSerialConnection(["OK Z UP\n"])
+        sender = GCodeSender(SerialConfig(port="COM20", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.send_command("ZU", startup_g90=False)
+
+        self.assertEqual(connection.writes, ["ZU\n"])
+        self.assertEqual(responses, ["OK Z UP"])
+        self.assertFalse(connection.closed)
+
+    def test_auxiliary_gui_command_uses_current_sender(self) -> None:
+        class RecordingSender:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, bool | None]] = []
+
+            def send_command(self, command: str, *, startup_g90: bool | None = None) -> list[str]:
+                self.calls.append((command, startup_g90))
+                return ["OK MAGNET ON"]
+
+        app = type("App", (), {})()
+        app.sender = RecordingSender()
+        app._get_sender = lambda: app.sender
+
+        responses = ScrabblePlotterApp._write_auxiliary_serial_line(app, "M1")
+
+        self.assertEqual(app.sender.calls, [("M1", False)])
+        self.assertEqual(responses, ["OK MAGNET ON"])
+
+    def test_board_actuator_sender_never_sends_startup_g90(self) -> None:
+        connection = _FakeSerialConnection(["ok board up\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.board_up()
+
+        self.assertEqual(connection.writes, ["BOARD_UP\n"])
+        self.assertEqual(responses, ["ok board up"])
+        self.assertFalse(connection.closed)
+
+    def test_board_actuator_sender_formats_word_command(self) -> None:
+        connection = _FakeSerialConnection(["ok word set HELLO\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.set_word("hello")
+
+        self.assertEqual(connection.writes, ["WORD_SET HELLO\n"])
+        self.assertEqual(responses, ["ok word set HELLO"])
+
+    def test_board_actuator_sender_formats_word_list_command(self) -> None:
+        connection = _FakeSerialConnection(["ok word list 2\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.set_words(["cat", "dog"])
+
+        self.assertEqual(connection.writes, ["WORD_LIST CAT,DOG\n"])
+        self.assertEqual(responses, ["ok word list 2"])
+
+    def test_board_actuator_sender_formats_word_clear_command(self) -> None:
+        connection = _FakeSerialConnection(["ok word clear\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.clear_words()
+
+        self.assertEqual(connection.writes, ["WORD_CLEAR\n"])
+        self.assertEqual(responses, ["ok word clear"])
+
+    def test_board_actuator_sender_formats_led_cells_command(self) -> None:
+        connection = _FakeSerialConnection(["ok led cells 2\n"])
+        sender = BoardActuatorSender(SerialConfig(port="COM21", baud=115200, timeout=0.01, startup_g90=True))
+        sender._connection = connection
+
+        responses = sender.set_led_cells(["a1", "c10"])
+
+        self.assertEqual(connection.writes, ["LED_CELLS A1,C10\n"])
+        self.assertEqual(responses, ["ok led cells 2"])
+
+
+class BoardActuatorGuiTests(unittest.TestCase):
+    def test_startup_sends_board_up_when_actuator_port_is_saved(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.actuator_port_var = _FakeVar("COM9")
+        app.calls = []
+        app.logs = []
+        app._send_actuator_command = lambda command: app.calls.append(command) or ["ok board up"]
+        app._log = app.logs.append
+
+        ScrabblePlotterApp._send_startup_board_up(app)
+
+        self.assertEqual(app.calls, ["BOARD_UP"])
+        self.assertIn("Startup board up command sent.", app.logs)
+
+    def test_startup_skips_board_up_when_no_actuator_port_is_saved(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.actuator_port_var = _FakeVar("")
+        app.calls = []
+        app.logs = []
+        app._send_actuator_command = lambda command: app.calls.append(command)
+        app._log = app.logs.append
+
+        ScrabblePlotterApp._send_startup_board_up(app)
+
+        self.assertEqual(app.calls, [])
+        self.assertIn("Startup board up skipped", app.logs[0])
+
+    def test_close_sends_board_down_and_closes_serial_connections(self) -> None:
+        class Closable:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class Root:
+            def __init__(self) -> None:
+                self.destroyed = False
+
+            def destroy(self) -> None:
+                self.destroyed = True
+
+        app = object.__new__(ScrabblePlotterApp)
+        app.actuator_port_var = _FakeVar("COM9")
+        app.commands = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok board down"]
+        app._log = lambda message: None
+        app.stop_camera = lambda clear_preview=False: None
+        app._actuator_sender = Closable()
+        app._actuator_sender_key = ("COM9", 115200, 2.0)
+        app._sender = Closable()
+        app.root = Root()
+
+        ScrabblePlotterApp._on_close(app)
+
+        self.assertEqual(app.commands, ["BOARD_DOWN"])
+        self.assertIsNone(app._actuator_sender)
+        self.assertIsNone(app._actuator_sender_key)
+        self.assertTrue(app._sender.closed)
+        self.assertTrue(app.root.destroyed)
+
+    def test_camera_challenge_words_are_unique_normalized_camera_words(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._last_camera_word_scan = type(
+            "Scan",
+            (),
+            {
+                "words": [
+                    CameraWord("cat", "horizontal_left_to_right", 90.0, 0, 0, 10, 10),
+                    CameraWord("CAT", "horizontal_left_to_right", 89.0, 0, 0, 10, 10),
+                    CameraWord("do-g", "vertical_top_to_bottom", 88.0, 0, 0, 10, 10),
+                ],
+                "grid": None,
+            },
+        )()
+
+        words = ScrabblePlotterApp._camera_challenge_words(app)
+
+        self.assertEqual(words, ["CAT", "DOG"])
+
+    def test_send_camera_words_to_actuator_uses_word_list_command(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.commands = []
+        app.statuses = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok word list 2"]
+        app._set_status = app.statuses.append
+
+        ScrabblePlotterApp._send_camera_words_to_actuator(app, ["CAT", "DOG"])
+
+        self.assertEqual(app.commands, ["WORD_LIST CAT,DOG"])
+        self.assertEqual(app.statuses[-1], "Sent 2 camera word(s) to the board actuator challenge list.")
+
+    def test_try_send_camera_words_to_actuator_clears_when_latest_scan_has_no_words(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.actuator_port_var = _FakeVar("COM9")
+        app._last_camera_word_scan = type("Scan", (), {"words": [], "grid": None})()
+        app.commands = []
+        app.logs = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok word clear"]
+        app._log = app.logs.append
+
+        ScrabblePlotterApp._try_send_camera_words_to_actuator(app)
+
+        self.assertEqual(app.commands, ["WORD_CLEAR"])
+        self.assertIn("Cleared board actuator challenge words", app.logs[-1])
+
+    def test_send_actuator_command_raises_on_arduino_error_response(self) -> None:
+        class Sender:
+            def send_command(self, command: str) -> list[str]:
+                return ["err invalid led grid"]
+
+        app = object.__new__(ScrabblePlotterApp)
+        app.statuses = []
+        app.logs = []
+        app._get_actuator_sender = lambda: Sender()
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+
+        with self.assertRaises(RuntimeError) as raised:
+            ScrabblePlotterApp._send_actuator_command(app, "CHALLENGE_START")
+
+        self.assertIn("err invalid led grid", str(raised.exception))
+        self.assertEqual(app.statuses[-1], "Sent actuator command: CHALLENGE_START")
+        self.assertIn("Actuator responses: err invalid led grid", app.logs[-1])
+
+    def test_start_challenge_sends_camera_words_challenge_then_letter_lights(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._letter_vars[9][2].set("C")
+        app._letter_vars[9][3].set("D")
+        app._last_camera_word_scan = type(
+            "Scan",
+            (),
+            {"words": [CameraWord("cat", "horizontal_left_to_right", 90.0, 0, 0, 10, 10)], "grid": None},
+        )()
+        app._last_camera_letter_scan = None
+        app._last_scan = None
+        app._pending_actuator_challenge_after_word_scan = False
+        app.commands = []
+        app.statuses = []
+        app.errors = []
+        app._capture_best_photo_for_ocr = lambda purpose: (_ for _ in ()).throw(RuntimeError("Start the camera first."))
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._set_status = app.statuses.append
+        app._show_error = app.errors.append
+
+        ScrabblePlotterApp.start_actuator_challenge(app)
+
+        labels = ScrabblePlotterApp._current_led_cell_labels(app)
+        self.assertEqual(app.commands, ["WORD_LIST CAT", "CHALLENGE_START", "LED_CELLS C10,D10"])
+        self.assertEqual(app.errors, [])
+        self.assertEqual(app.statuses[-1], "Challenge started with 2 red LED cell(s).")
+        self.assertEqual(labels, ["C10", "D10"])
+
+    def test_start_challenge_does_not_send_blank_letter_lights(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._last_camera_letter_scan = None
+        app._last_camera_word_scan = None
+        app._last_scan = None
+        app._pending_actuator_challenge_after_word_scan = False
+        app.commands = []
+        app.errors = []
+        app._capture_best_photo_for_ocr = lambda purpose: (_ for _ in ()).throw(RuntimeError("Start the camera first."))
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._show_error = app.errors.append
+
+        ScrabblePlotterApp.start_actuator_challenge(app)
+
+        self.assertEqual(app.commands, [])
+        self.assertEqual(len(app.errors), 1)
+        self.assertIn("No board letters", str(app.errors[0]))
+
+    def test_pending_challenge_uses_fresh_camera_word_scan_grid(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._camera_word_scan_token = 4
+        app._camera_word_scan_running = True
+        app._pending_actuator_challenge_after_word_scan = True
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._last_camera_letter_scan = None
+        app._last_scan = None
+        app.commands = []
+        app.statuses = []
+        app.errors = []
+        app._lock_scan_to_manual_board_grid = lambda scan: None
+        app._set_camera_words_text = lambda text: None
+        app._refresh_camera_preview = lambda: None
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._set_status = app.statuses.append
+        app._show_error = app.errors.append
+        def apply_grid(grid):
+            for cell in grid.cells:
+                app._letter_vars[cell.row][cell.col].set(cell.letter)
+            return len(grid.cells)
+        app._apply_camera_letter_scan_to_locked_board_grid = lambda scan: 0
+        app._apply_camera_ocr_grid_to_board_form = apply_grid
+
+        scan = CameraWordScanResult(
+            words=[CameraWord("cat", "horizontal_left_to_right", 90.0, 0, 0, 10, 10)],
+            grid=CameraOcrGrid(
+                corners=[],
+                cells=[
+                    CameraGridCell(row=9, col=2, square="C10", letter="C", confidence=90.0, source="test"),
+                    CameraGridCell(row=9, col=3, square="D10", letter="A", confidence=90.0, source="test"),
+                    CameraGridCell(row=9, col=4, square="E10", letter="T", confidence=90.0, source="test"),
+                ],
+            ),
+        )
+
+        ScrabblePlotterApp._handle_camera_word_scan_result(app, scan, announce=False, scan_token=4)
+
+        labels = ScrabblePlotterApp._current_led_cell_labels(app)
+        self.assertEqual(app.commands, ["WORD_LIST CAT", "CHALLENGE_START", "LED_CELLS C10,D10,E10"])
+        self.assertFalse(app._pending_actuator_challenge_after_word_scan)
+        self.assertEqual(app.errors, [])
+        self.assertEqual(labels, ["C10", "D10", "E10"])
+
+    def test_current_led_cell_labels_use_visible_gui_letters_in_column_order(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._letter_vars[9][2].set("C")
+        app._letter_vars[9][3].set("D")
+        app._last_camera_letter_scan = None
+        app._last_camera_word_scan = None
+        app._last_scan = None
+
+        labels = ScrabblePlotterApp._current_led_cell_labels(app)
+
+        self.assertEqual(labels, ["C10", "D10"])
+
+    def test_current_led_cell_labels_ignore_live_camera_overlay_letters(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._letter_vars[9][2].set("C")
+        app._last_camera_letter_scan = type(
+            "Scan",
+            (),
+            {
+                "grid": CameraOcrGrid(
+                    corners=[],
+                    cells=[
+                        CameraGridCell(row=9, col=2, square="C10", letter="C", confidence=90.0, source="test"),
+                        CameraGridCell(row=9, col=3, square="D10", letter="D", confidence=90.0, source="test"),
+                    ],
+                )
+            },
+        )()
+        app._last_camera_word_scan = None
+        app._last_scan = None
+
+        labels = ScrabblePlotterApp._current_led_cell_labels(app)
+
+        self.assertEqual(labels, ["C10"])
+
+    def test_send_led_cells_to_actuator_uses_led_cells_command(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.commands = []
+        app.statuses = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._set_status = app.statuses.append
+
+        ScrabblePlotterApp._send_led_cells_to_actuator(app, ["A1", "C10"])
+
+        self.assertEqual(app.commands, ["LED_CELLS A1,C10"])
+        self.assertEqual(app.statuses[-1], "Sent letter lights to the board actuator (2 lit cell(s)).")
+
+    def test_send_led_cells_to_actuator_rejects_too_long_command(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.commands = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        labels = [f"{chr(ord('A') + col)}{row}" for col in range(BOARD_SIZE) for row in range(1, BOARD_SIZE + 1)]
+
+        with self.assertRaises(ValueError):
+            ScrabblePlotterApp._send_led_cells_to_actuator(app, labels, announce=False)
+
+        self.assertEqual(app.commands, [])
+
+    def test_reveal_actuator_word_sends_word_choose_only(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.commands = []
+        app.errors = []
+        app._send_actuator_command = lambda command: app.commands.append(command) or ["ok"]
+        app._show_error = app.errors.append
+
+        ScrabblePlotterApp.reveal_actuator_word(app)
+
+        self.assertEqual(app.commands, ["WORD_CHOOSE"])
+        self.assertEqual(app.errors, [])
+
+    def test_letter_capture_does_not_clear_tile_rack_side_from_board_grid(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._camera_letter_scan_token = 7
+        app._live_letter_scan_running = True
+        app._last_live_letter_scan_error = "old"
+        app.captured_letters_var = _FakeVar("")
+        app.statuses = []
+        app.logs = []
+        app._lock_scan_to_manual_board_grid = lambda scan: None
+        app._apply_camera_letter_scan_to_locked_board_grid = lambda scan: 0
+        app._apply_camera_ocr_grid_to_board_form = lambda grid: 0
+        app._clear_tile_rack_side_from_main_ocr_grid = lambda: (_ for _ in ()).throw(
+            AssertionError("tile rack side cleanup should not run during letter capture")
+        )
+        app._set_status = app.statuses.append
+        app._refresh_camera_preview = lambda: None
+        app._log = app.logs.append
+        app._try_send_letter_leds_to_actuator = lambda *args, **kwargs: None
+
+        scan = CameraLetterScanResult(letters=[], grid=None)
+
+        ScrabblePlotterApp._handle_camera_letter_scan_result(app, scan, announce=True, scan_token=7)
+
+        self.assertFalse(app._live_letter_scan_running)
+        self.assertEqual(app.captured_letters_var.get(), "")
+        self.assertIn("No letters captured", app.statuses[-1])
+
+class _FakeFrame:
+    def __init__(self, shape: tuple[int, ...] = (2, 2, 3)):
+        self.shape = shape
+
+
+class _FakeCapture:
+    def __init__(self, opened: bool = True, reads: list[tuple[bool, object | None]] | None = None):
+        self.opened = opened
+        self.reads = list(reads or [])
+        self.released = False
+        self.set_calls: list[tuple[int, object]] = []
+
+    def isOpened(self) -> bool:
+        return self.opened
+
+    def read(self) -> tuple[bool, object | None]:
+        if self.reads:
+            return self.reads.pop(0)
+        return False, None
+
+    def release(self) -> None:
+        self.released = True
+
+    def set(self, prop: int, value: object) -> bool:
+        self.set_calls.append((prop, value))
+        return True
+
+
+class _FakeCv2:
+    CAP_PROP_FOURCC = 1
+    CAP_PROP_FRAME_WIDTH = 2
+    CAP_PROP_FRAME_HEIGHT = 3
+    CAP_PROP_ZOOM = 4
+
+    def __init__(self, captures: list[_FakeCapture]):
+        self.captures = list(captures)
+        self.open_calls: list[tuple[int, int | None]] = []
+
+    def VideoCapture(self, camera_index: int, backend: int | None = None) -> _FakeCapture:
+        self.open_calls.append((camera_index, backend))
+        return self.captures.pop(0)
+
+    def VideoWriter_fourcc(self, *characters: str) -> int:
+        self.fourcc_call = characters
+        return 1234
+
+
+def _synthetic_board_image(cell_size: int, letters: dict[str, str]):
+    import numpy as np
+
+    cv2 = _require_cv2_for_tests()
+    size = BOARD_SIZE * cell_size
+    image = np.full((size, size, 3), 255, dtype=np.uint8)
+    for square, letter in letters.items():
+        parsed = parse_square_label(square)
+        x = parsed.col * cell_size + int(cell_size * 0.25)
+        y = parsed.row * cell_size + int(cell_size * 0.72)
+        cv2.putText(
+            image,
+            letter,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    return image
+
+
+def _paddle_box(text: str, confidence: float, left: int, top: int) -> PaddleOcrTextBox:
+    return _ocr_box(text, confidence, left, top, 20, 20)
+
+
+def _ocr_box(
+    text: str,
+    confidence: float,
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+) -> PaddleOcrTextBox:
+    return PaddleOcrTextBox(
+        text=text,
+        confidence=confidence,
+        points=[
+            (float(left), float(top)),
+            (float(left + width), float(top)),
+            (float(left + width), float(top + height)),
+            (float(left), float(top + height)),
+        ],
+    )
+
+
+def _easyocr_result(
+    text: str,
+    confidence: float,
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+) -> list[object]:
+    return [
+        [
+            [left, top],
+            [left + width, top],
+            [left + width, top + height],
+            [left, top + height],
+        ],
+        text,
+        confidence,
+    ]
+
+
+def _camera_tile(letter: str, confidence: float, left: int, top: int) -> CameraTile:
+    return CameraTile(
+        letter=letter,
+        confidence=confidence,
+        corners=[
+            (float(left), float(top)),
+            (float(left + 20), float(top)),
+            (float(left + 20), float(top + 20)),
+            (float(left), float(top + 20)),
+        ],
+    )
+
+
+def _synthetic_tile_image(tiles: list[tuple[str, int, int]]):
+    import numpy as np
+
+    cv2 = _require_cv2_for_tests()
+    image = np.full((150, 220, 3), 180, dtype=np.uint8)
+    tile_size = 40
+    for letter, left, top in tiles:
+        cv2.rectangle(image, (left, top), (left + tile_size, top + tile_size), (245, 245, 238), -1)
+        cv2.rectangle(image, (left, top), (left + tile_size, top + tile_size), (25, 25, 25), 2)
+        if letter:
+            cv2.putText(
+                image,
+                letter,
+                (left + 11, top + 29),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.85,
+                (0, 0, 0),
+                2,
+                cv2.LINE_AA,
+            )
+    return image
+
+
+def _synthetic_dark_tile_image(tiles: list[tuple[str, int, int]]):
+    import numpy as np
+
+    cv2 = _require_cv2_for_tests()
+    image = np.full((150, 220, 3), 180, dtype=np.uint8)
+    tile_size = 40
+    for letter, left, top in tiles:
+        cv2.rectangle(image, (left, top), (left + tile_size, top + tile_size), (8, 8, 8), -1)
+        cv2.rectangle(image, (left, top), (left + tile_size, top + tile_size), (245, 245, 245), 2)
+        if letter:
+            cv2.putText(
+                image,
+                letter,
+                (left + 11, top + 29),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.85,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+    return image
+
+
+def _synthetic_light_tile_board_image(tiles: list[tuple[str, int, int]]):
+    import numpy as np
+
+    cv2 = _require_cv2_for_tests()
+    image = np.full((150, 220, 3), 20, dtype=np.uint8)
+    tile_size = 40
+    for letter, left, top in tiles:
+        cv2.rectangle(image, (left, top), (left + tile_size, top + tile_size), (238, 238, 210), -1)
+        if letter:
+            cv2.putText(
+                image,
+                letter,
+                (left + 11, top + 29),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.85,
+                (20, 20, 20),
+                2,
+                cv2.LINE_AA,
+            )
+    return image
+
+
+def _synthetic_white_on_black_text_image():
+    import numpy as np
+
+    cv2 = _require_cv2_for_tests()
+    image = np.full((150, 280, 3), 128, dtype=np.uint8)
+    cv2.rectangle(image, (10, 20), (120, 75), (0, 0, 0), -1)
+    cv2.putText(image, "CAT", (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.rectangle(image, (150, 20), (260, 75), (255, 255, 255), -1)
+    cv2.putText(image, "DOG", (158, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.rectangle(image, (10, 90), (58, 135), (0, 0, 0), -1)
+    cv2.putText(image, "A", (21, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.rectangle(image, (72, 90), (122, 135), (255, 255, 255), -1)
+    cv2.putText(image, "B", (84, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2, cv2.LINE_AA)
+    return image
+
+
+def _synthetic_multi_word_white_on_black_text_image():
+    import numpy as np
+
+    cv2 = _require_cv2_for_tests()
+    image = np.full((150, 280, 3), 128, dtype=np.uint8)
+    cv2.rectangle(image, (10, 20), (120, 75), (0, 0, 0), -1)
+    cv2.putText(image, "CAT", (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.rectangle(image, (130, 20), (230, 75), (0, 0, 0), -1)
+    cv2.putText(image, "OIL", (140, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.rectangle(image, (10, 90), (125, 140), (255, 255, 255), -1)
+    cv2.putText(image, "DOG", (20, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2, cv2.LINE_AA)
+    return image
+
+
+def _synthetic_camera_board_image():
+    import numpy as np
+
+    cv2 = _require_cv2_for_tests()
+    image = np.full((600, 800, 3), 240, dtype=np.uint8)
+    points = np.array([[160, 80], [650, 100], [620, 560], [130, 520]], dtype=np.int32)
+    cv2.fillConvexPoly(image, points, (245, 245, 245))
+    cv2.polylines(image, [points], True, (20, 20, 20), 5, cv2.LINE_AA)
+    for index in range(BOARD_SIZE + 1):
+        alpha = index / BOARD_SIZE
+        left = (points[0] * (1 - alpha) + points[3] * alpha).astype(int)
+        right = (points[1] * (1 - alpha) + points[2] * alpha).astype(int)
+        top = (points[0] * (1 - alpha) + points[1] * alpha).astype(int)
+        bottom = (points[3] * (1 - alpha) + points[2] * alpha).astype(int)
+        cv2.line(image, tuple(left), tuple(right), (90, 90, 90), 1, cv2.LINE_AA)
+        cv2.line(image, tuple(top), tuple(bottom), (90, 90, 90), 1, cv2.LINE_AA)
+    return image, [(160.0, 80.0), (650.0, 100.0), (620.0, 560.0), (130.0, 520.0)]
+
+
+def _require_cv2_for_tests():
+    try:
+        import cv2  # type: ignore
+    except ImportError as exc:
+        raise unittest.SkipTest("OpenCV is required for scanner tests.") from exc
+    return cv2
+
+
+if __name__ == "__main__":
+    unittest.main()
