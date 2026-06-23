@@ -209,7 +209,8 @@
   "actuator_baud": 115200,
   "actuator_timeout": 2.0,
   "actuator_countdown_seconds": 30,
-  "tile_cart_url": "http://192.168.4.1",
+  "tile_cart_url": "http://172.20.10.2",
   "tile_cart_player_1_command": "backward",
-  "tile_cart_player_2_command": "forward"
+  "tile_cart_player_2_command": "forward",
+  "tile_cart_distance_cm": 8.0
 }

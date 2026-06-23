@@ -118,6 +118,7 @@ class ScrabblePlotterApp:
         self.tile_cart_player_1_command_var = tk.StringVar(value=self._calibration.tile_cart_player_1_command)
         self.tile_cart_player_2_command_var = tk.StringVar(value=self._calibration.tile_cart_player_2_command)
         self.tile_cart_enabled_var = tk.BooleanVar(value=True)
+        self.tile_cart_distance_cm_var = tk.StringVar(value=str(self._calibration.tile_cart_distance_cm))
         self.openai_endpoint_var = tk.StringVar(value=os.environ.get("OPENAI_ENDPOINT", DEFAULT_OPENAI_ENDPOINT))
         self.openai_api_key_var = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
         self.openai_model_var = tk.StringVar(value=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
@@ -543,11 +544,20 @@ class ScrabblePlotterApp:
         for index, (label, variable) in enumerate(cart_fields, start=1):
             ttk.Label(cart_box, text=label).grid(row=index, column=0, sticky="w", pady=2)
             ttk.Entry(cart_box, textvariable=variable).grid(row=index, column=1, sticky="ew", padx=(8, 0), pady=2)
+
+        ttk.Label(cart_box, text="Distance (cm)").grid(row=4, column=0, sticky="w", pady=2)
+        dist_frame = ttk.Frame(cart_box)
+        dist_frame.grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=2)
+        dist_frame.columnconfigure(0, weight=1)
+
+        ttk.Entry(dist_frame, textvariable=self.tile_cart_distance_cm_var).grid(row=0, column=0, sticky="ew")
+        ttk.Button(dist_frame, text="Set Distance", command=self.set_tile_cart_distance).grid(row=0, column=1, padx=(6, 0))
+
         ttk.Button(cart_box, text="Move To Player", command=self.move_tile_cart_to_current_player).grid(
-            row=4, column=0, sticky="ew", pady=(6, 0), padx=(0, 4)
+            row=5, column=0, sticky="ew", pady=(6, 0), padx=(0, 4)
         )
         ttk.Button(cart_box, text="Stop Cart", command=lambda: self.send_tile_cart_command("stop")).grid(
-            row=4, column=1, sticky="ew", pady=(6, 0), padx=(4, 0)
+            row=5, column=1, sticky="ew", pady=(6, 0), padx=(4, 0)
         )
 
         self.words_table = ttk.Treeview(game_box, columns=("P1", "P2"), show="headings", height=6)
@@ -665,6 +675,7 @@ class ScrabblePlotterApp:
         self.tile_cart_url_var.set(self._calibration.tile_cart_url)
         self.tile_cart_player_1_command_var.set(self._calibration.tile_cart_player_1_command)
         self.tile_cart_player_2_command_var.set(self._calibration.tile_cart_player_2_command)
+        self.tile_cart_distance_cm_var.set(str(self._calibration.tile_cart_distance_cm))
         self._load_premium_layout_into_form()
         if len(self._calibration.image_corners) == 4:
             self._set_status("Loaded board calibration. Start the camera to find visible words.")
@@ -4536,6 +4547,10 @@ class ScrabblePlotterApp:
         calibration.tile_cart_url = self.tile_cart_url_var.get().strip() or "http://192.168.4.1"
         calibration.tile_cart_player_1_command = self.tile_cart_player_1_command_var.get().strip() or "backward"
         calibration.tile_cart_player_2_command = self.tile_cart_player_2_command_var.get().strip() or "forward"
+        try:
+            calibration.tile_cart_distance_cm = float(self.tile_cart_distance_cm_var.get())
+        except Exception:
+            calibration.tile_cart_distance_cm = 30.0
         calibration.premium_layout = self._premium_layout_from_form()
         return calibration
 
@@ -5534,7 +5549,42 @@ class ScrabblePlotterApp:
             raise ValueError("Enter the tile cart ESP32 URL.")
         if not base_url.startswith(("http://", "https://")):
             base_url = "http://" + base_url
-        return base_url.rstrip("/") + "/" + urllib.parse.quote(self._normalize_tile_cart_command(command))
+        normalized = self._normalize_tile_cart_command(command)
+        return base_url.rstrip("/") + "/" + urllib.parse.quote(normalized)
+
+    def set_tile_cart_distance(self) -> None:
+        try:
+            distance_str = self.tile_cart_distance_cm_var.get().strip()
+            if not distance_str:
+                raise ValueError("Enter the tile cart distance in cm.")
+            distance_cm = float(distance_str)
+
+            # Update the calibration model and save it
+            self._calibration = self._calibration_from_form()
+            self._calibration.save(self.calibration_path.get())
+
+            base_url = self.tile_cart_url_var.get().strip()
+            if not base_url:
+                raise ValueError("Enter the tile cart ESP32 URL.")
+            if not base_url.startswith(("http://", "https://")):
+                base_url = "http://" + base_url
+            url = base_url.rstrip("/") + "/distance?val=" + urllib.parse.quote(str(distance_cm))
+        except Exception as exc:
+            self._show_error(exc)
+            return
+
+        def work() -> str:
+            with urllib.request.urlopen(url, timeout=5.0) as response:
+                return response.read().decode("utf-8", errors="replace").strip()
+
+        def done(message: str) -> None:
+            self._set_status(f"Distance set to {distance_cm} cm.")
+            self._log(f"Tile cart set distance: {message or 'ok'}")
+
+        def on_error(exc: Exception) -> None:
+            self._show_error(exc)
+
+        self._run_background_task(f"Setting tile cart distance to {distance_cm} cm...", work, done, on_error)
 
     def run_ai_player_turn(self) -> None:
         try:
