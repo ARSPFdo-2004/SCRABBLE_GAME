@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 
@@ -55,6 +56,7 @@ class GCodeSender:
     def __init__(self, config: SerialConfig):
         self.config = config
         self._connection = None
+        self._lock = threading.RLock()
 
     def send_move(
         self,
@@ -85,7 +87,7 @@ class GCodeSender:
             return
 
         serial = _require_serial()
-        connection = serial.Serial(self.config.port, self.config.baud, timeout=self.config.timeout)
+        connection = serial.Serial(self.config.port, self.config.baud, timeout=self.config.timeout, write_timeout=self.config.timeout)
         try:
             connection.setDTR(False)
             connection.setRTS(False)
@@ -108,28 +110,29 @@ class GCodeSender:
             self._connection = None
 
     def send_commands(self, commands: list[str], *, startup_g90: bool | None = None) -> list[str]:
-        should_close = self._connection is None
-        if should_close:
-            self.open()
-
-        connection = self._connection
-        if connection is None:
-            raise RuntimeError("Serial connection could not be opened.")
-
-        try:
-            should_send_startup_g90 = self.config.startup_g90 if startup_g90 is None else startup_g90
-            if should_send_startup_g90:
-                self._write_line(connection, "G90")
-                self._read_responses(connection)
-
-            responses: list[str] = []
-            for command in commands:
-                self._write_line(connection, command)
-                responses.extend(self._read_responses(connection))
-            return responses
-        finally:
+        with self._lock:
+            should_close = self._connection is None
             if should_close:
-                self.close()
+                self.open()
+
+            connection = self._connection
+            if connection is None:
+                raise RuntimeError("Serial connection could not be opened.")
+
+            try:
+                should_send_startup_g90 = self.config.startup_g90 if startup_g90 is None else startup_g90
+                if should_send_startup_g90:
+                    self._write_line(connection, "G90")
+                    self._read_responses(connection)
+
+                responses: list[str] = []
+                for command in commands:
+                    self._write_line(connection, command)
+                    responses.extend(self._read_responses(connection))
+                return responses
+            finally:
+                if should_close:
+                    self.close()
 
     def _write_line(self, connection, line: str) -> None:  # type: ignore[no-untyped-def]
         connection.write((line.strip() + "\n").encode("utf-8"))
@@ -141,9 +144,7 @@ class GCodeSender:
         while time.monotonic() < deadline:
             raw = connection.readline()
             if not raw:
-                if responses:
-                    break
-                continue
+                break
             message = raw.decode("utf-8", errors="replace").strip()
             if not message:
                 continue

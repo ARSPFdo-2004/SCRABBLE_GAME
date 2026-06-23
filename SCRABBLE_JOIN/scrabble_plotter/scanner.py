@@ -421,12 +421,13 @@ def scan_camera_words(
     boxes = parse_easyocr_text_boxes(raw_result, confidence_threshold=confidence_threshold)
     boxes = camera_character_text_boxes(frame, boxes)
     text_box_tiles = camera_tiles_from_text_boxes(boxes)
-    detected_words = _dedupe_camera_words(
+    detected_words = filter_matching_words(_dedupe_camera_words(
         identify_directional_tile_words(detected_tiles) + identify_directional_words(boxes)
-    )
+    ))
+    detected_words = _remove_contained_partial_words(detected_words)
     grid = build_camera_ocr_grid(frame, tiles=detected_tiles, text_boxes=boxes)
     return CameraWordScanResult(
-        words=filter_matching_words(detected_words),
+        words=detected_words,
         tiles=detected_tiles or text_box_tiles,
         text_boxes=boxes,
         grid=grid,
@@ -1139,11 +1140,16 @@ def cell_looks_occupied(cell_image) -> bool:  # type: ignore[no-untyped-def]
 
 
 def read_cell_with_tesseract(cell_image, square: str) -> tuple[str, float]:  # type: ignore[no-untyped-def]
-    pytesseract = _require_pytesseract()
-    processed = preprocess_cell_for_ocr(cell_image)
-    config = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    data = pytesseract.image_to_data(processed, config=config, output_type=pytesseract.Output.DICT)
-    return parse_tesseract_data(data)
+    try:
+        pytesseract = _require_pytesseract()
+        processed = preprocess_cell_for_ocr(cell_image)
+        config = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        data = pytesseract.image_to_data(processed, config=config, output_type=pytesseract.Output.DICT)
+        return parse_tesseract_data(data)
+    except Exception as exc:
+        if "tesseract is not installed" in str(exc).lower() or "not in your path" in str(exc).lower():
+            return read_tile_letter_with_easyocr(cell_image)
+        raise
 
 
 def parse_tesseract_data(data: dict[str, list[Any]]) -> tuple[str, float]:
@@ -1357,19 +1363,15 @@ def _letter_runs(boxes: list[Any], line_axis: str) -> list[list[Any]]:
         tolerance = _median([box.height for box in boxes]) * 0.65
         position = lambda box: box.center_y
         run_sort = lambda box: box.center_x
-        gap_limit = max(
-            _median([box.width for box in boxes]) * 3.5,
-            _median([box.height for box in boxes]) * 2.4,
-        )
+        edge_gap = lambda current, previous: max(0.0, current.left - previous.right)
+        gap_limit = max(24.0, _median([box.width for box in boxes]) * 1.6)
     else:
         sorted_boxes = sorted(boxes, key=lambda box: box.center_x)
         tolerance = _median([box.width for box in boxes]) * 0.65
         position = lambda box: box.center_x
         run_sort = lambda box: box.center_y
-        gap_limit = max(
-            _median([box.height for box in boxes]) * 3.5,
-            _median([box.width for box in boxes]) * 2.4,
-        )
+        edge_gap = lambda current, previous: max(0.0, current.top - previous.bottom)
+        gap_limit = max(24.0, _median([box.height for box in boxes]) * 1.6)
 
     tolerance = max(8.0, tolerance)
     clusters: list[list[Any]] = []
@@ -1390,7 +1392,7 @@ def _letter_runs(boxes: list[Any], line_axis: str) -> list[list[Any]]:
         current: list[Any] = []
         previous: Any | None = None
         for box in ordered:
-            if previous is not None and abs(run_sort(box) - run_sort(previous)) > max(28.0, gap_limit):
+            if previous is not None and edge_gap(box, previous) > gap_limit:
                 if current:
                     runs.append(current)
                 current = []
@@ -1399,6 +1401,57 @@ def _letter_runs(boxes: list[Any], line_axis: str) -> list[list[Any]]:
         if current:
             runs.append(current)
     return runs
+
+
+def _remove_contained_partial_words(words: list[CameraWord]) -> list[CameraWord]:
+    kept: list[CameraWord] = []
+    for word in sorted(words, key=lambda item: (-len(item.word), item.top, item.left, item.word)):
+        if _is_contained_partial_word(word, kept):
+            continue
+        kept.append(word)
+    return sorted(kept, key=lambda item: (_direction_sort_rank(item.direction), item.top, item.left, item.word))
+
+
+def _is_contained_partial_word(candidate: CameraWord, longer_words: list[CameraWord]) -> bool:
+    candidate_word = candidate.word
+    for longer in longer_words:
+        if candidate.direction != longer.direction:
+            continue
+        if len(candidate_word) >= len(longer.word):
+            continue
+        if candidate_word not in longer.word:
+            continue
+        if _word_boxes_same_line(candidate, longer) and _word_axis_contains(longer, candidate):
+            return True
+    return False
+
+
+def _word_boxes_same_line(first: CameraWord, second: CameraWord) -> bool:
+    if first.direction == HORIZONTAL_LEFT_TO_RIGHT:
+        first_center = first.top + first.height / 2.0
+        second_center = second.top + second.height / 2.0
+        tolerance = max(first.height, second.height) * 0.75
+        return abs(first_center - second_center) <= max(8.0, tolerance)
+
+    first_center = first.left + first.width / 2.0
+    second_center = second.left + second.width / 2.0
+    tolerance = max(first.width, second.width) * 0.75
+    return abs(first_center - second_center) <= max(8.0, tolerance)
+
+
+def _word_axis_contains(container: CameraWord, contained: CameraWord) -> bool:
+    tolerance = 8.0
+    if container.direction == HORIZONTAL_LEFT_TO_RIGHT:
+        container_start = float(container.left) - tolerance
+        container_end = float(container.left + container.width) + tolerance
+        contained_start = float(contained.left)
+        contained_end = float(contained.left + contained.width)
+    else:
+        container_start = float(container.top) - tolerance
+        container_end = float(container.top + container.height) + tolerance
+        contained_start = float(contained.top)
+        contained_end = float(contained.top + contained.height)
+    return contained_start >= container_start and contained_end <= container_end
 
 
 def _camera_word_from_boxes(word: str, direction: str, boxes: list[EasyOcrTextBox]) -> CameraWord:

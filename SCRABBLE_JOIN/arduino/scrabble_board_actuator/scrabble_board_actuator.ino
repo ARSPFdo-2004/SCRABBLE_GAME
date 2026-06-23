@@ -23,6 +23,7 @@ int servoStep = 0;
 unsigned long lastServoStepTime = 0;
 bool boardRaised = false;
 bool servoMoving = false;
+bool animatingWin = false;
 
 void writeActuator(int angle) {
   actuatorServo.write(angle);
@@ -172,6 +173,7 @@ const char* currentWord() {
 }
 
 void clearLEDs() {
+  animatingWin = false;
   strip.clear();
   strip.show();
 }
@@ -212,9 +214,11 @@ bool parseLedCellToken(const char* token, byte* row, byte* col) {
   return true;
 }
 
-bool showLedCells(char* payload, int* litCount) {
-  strip.clear();
-  *litCount = 0;
+bool showLedCells(char* payload, int* litCount, bool clearFirst, bool showAfter) {
+  if (clearFirst) {
+    strip.clear();
+    *litCount = 0;
+  }
 
   char* tokenStart = payload;
   for (char* cursor = payload; ; cursor++) {
@@ -229,8 +233,10 @@ bool showLedCells(char* payload, int* litCount) {
         byte row = 0;
         byte col = 0;
         if (!parseLedCellToken(tokenStart, &row, &col)) {
-          strip.clear();
-          strip.show();
+          if (clearFirst) {
+            strip.clear();
+            strip.show();
+          }
           return false;
         }
 
@@ -249,7 +255,9 @@ bool showLedCells(char* payload, int* litCount) {
     }
   }
 
-  strip.show();
+  if (showAfter) {
+    strip.show();
+  }
   return true;
 }
 
@@ -603,7 +611,11 @@ void handleSerialCommand(char* rawCommand) {
     chooseCurrentWord();
     Serial.print(F("ok word choose "));
     Serial.println(currentWord());
+  } else if (strcmp(cmd, "LED_WIN") == 0) {
+    animatingWin = true;
+    Serial.println(F("ok led win"));
   } else if (strcmp(cmd, "LED_CLEAR") == 0) {
+    animatingWin = false;
     clearLEDs();
     Serial.println(F("ok led clear"));
   } else if (strcmp(cmd, "LED_TEST") == 0) {
@@ -612,12 +624,24 @@ void handleSerialCommand(char* rawCommand) {
   } else if (commandStartsWith(cmd, "LED_CELLS")) {
     char* payload = trimWhitespace(cmd + strlen("LED_CELLS"));
     int litCount = 0;
-    if (!showLedCells(payload, &litCount)) {
+    if (!showLedCells(payload, &litCount, true, true)) {
       Serial.println(F("err invalid led cells"));
       return;
     }
     Serial.print(F("ok led cells "));
     Serial.println(litCount);
+  } else if (commandStartsWith(cmd, "LED_APPEND")) {
+    char* payload = trimWhitespace(cmd + strlen("LED_APPEND"));
+    int litCount = 0;
+    if (!showLedCells(payload, &litCount, false, false)) {
+      Serial.println(F("err invalid led append"));
+      return;
+    }
+    Serial.print(F("ok led append "));
+    Serial.println(litCount);
+  } else if (commandStartsWith(cmd, "LED_SHOW")) {
+    strip.show();
+    Serial.println(F("ok led show"));
   } else if (strcmp(cmd, "DISPLAY_ON") == 0) {
     displayOn = true;
     Serial.println(F("ok display on"));
@@ -651,6 +675,21 @@ void updateTimedStates() {
 }
 
 // ================= DISPLAY DRAWING =================
+void updateLEDAnimations() {
+  if (animatingWin) {
+    static uint32_t lastAnimUpdate = 0;
+    uint32_t ms = millis();
+    if (ms - lastAnimUpdate > 30) {
+      lastAnimUpdate = ms;
+      for(int i=0; i<strip.numPixels(); i++) {
+        int pixelHue = (i * 65536L / strip.numPixels()) + (ms * 50);
+        strip.setPixelColor(i, strip.gamma32(strip.ColorHSV(pixelHue)));
+      }
+      strip.show();
+    }
+  }
+}
+
 void drawDisplayContent() {
   if (!displayOn) {
     return;
@@ -738,4 +777,5 @@ void loop() {
   updateButtons();
   updateTimedStates();
   updateDisplay();
+  updateLEDAnimations();
 }

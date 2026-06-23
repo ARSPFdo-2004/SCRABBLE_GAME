@@ -53,8 +53,8 @@ right or vertically from top to bottom, then matches them against a generated
 `0` for `O` and `1` or `|` for `I` are normalized. The first EasyOCR run may
 take longer while OCR models are loaded.
 
-The Gemini Agent panel is still available for optional plotter-action requests,
-but camera word detection does not need a Gemini API key.
+The OpenAI Agent panel is still available for optional plotter-action requests,
+but camera word detection does not need an OpenAI API key.
 
 Movement uses this formula:
 

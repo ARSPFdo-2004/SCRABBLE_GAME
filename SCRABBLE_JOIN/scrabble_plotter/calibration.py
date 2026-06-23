@@ -26,6 +26,12 @@ DEFAULT_OCR_CELL_SIZE_PX = 80
 DEFAULT_ACTUATOR_BAUD = 115200
 DEFAULT_ACTUATOR_TIMEOUT = 2.0
 DEFAULT_ACTUATOR_COUNTDOWN_SECONDS = 30
+MACHINE_LABEL_ORIENTATION_A1_TOP_LEFT = "A1-top-left"
+MACHINE_LABEL_ORIENTATION_A1_TOP_RIGHT = "A1-top-right"
+VALID_MACHINE_LABEL_ORIENTATIONS = {
+    MACHINE_LABEL_ORIENTATION_A1_TOP_LEFT,
+    MACHINE_LABEL_ORIENTATION_A1_TOP_RIGHT,
+}
 
 
 def _require_cv2():
@@ -42,9 +48,11 @@ def _require_cv2():
 class PlotterCalibration:
     board_size: int = BOARD_SIZE
     label_orientation: str = "A1-top-left"
+    machine_label_orientation: str = MACHINE_LABEL_ORIENTATION_A1_TOP_LEFT
     image_path: str | None = None
     image_corners: list[list[float]] = field(default_factory=list)
     camera_index: int = 0
+    tile_rack_camera_index: int = 1
     offset_x_mm: float = 0.0
     offset_y_mm: float = 0.0
     cell_size_mm: float = CELL_SIZE_MM
@@ -53,6 +61,9 @@ class PlotterCalibration:
     y_steps_per_mm: float = 80.0
     cart_x_mm: float = 0.0
     cart_y_mm: float = 0.0
+    tile_rack_x_mm: float = 335.0
+    tile_rack_y_mm: float = 30.0
+    tile_rack_pitch_mm: float = 10.0
     premium_layout: list[list[str]] = field(default_factory=lambda: default_premium_layout())
     ocr_confidence_threshold: float = DEFAULT_OCR_CONFIDENCE_THRESHOLD
     ocr_cell_size_px: int = DEFAULT_OCR_CELL_SIZE_PX
@@ -60,6 +71,9 @@ class PlotterCalibration:
     actuator_baud: int = DEFAULT_ACTUATOR_BAUD
     actuator_timeout: float = DEFAULT_ACTUATOR_TIMEOUT
     actuator_countdown_seconds: int = DEFAULT_ACTUATOR_COUNTDOWN_SECONDS
+    tile_cart_url: str = "http://192.168.4.1"
+    tile_cart_player_1_command: str = "backward"
+    tile_cart_player_2_command: str = "forward"
 
     def set_image_corners(
         self,
@@ -86,6 +100,9 @@ class PlotterCalibration:
             raise ValueError("Cell size must be greater than 0.")
         if self.x_steps_per_mm <= 0 or self.y_steps_per_mm <= 0:
             raise ValueError("Stepper scale must be greater than 0.")
+        if self.machine_label_orientation not in VALID_MACHINE_LABEL_ORIENTATIONS:
+            expected = ", ".join(sorted(VALID_MACHINE_LABEL_ORIENTATIONS))
+            raise ValueError(f"Machine label orientation must be one of: {expected}.")
 
     def validate_ready_for_scan(self) -> None:
         if self.board_size != BOARD_SIZE:
@@ -112,9 +129,18 @@ class PlotterCalibration:
 
     def square_center_in_machine(self, square: Square) -> tuple[float, float]:
         pitch_mm = self.cell_size_mm + self.cell_margin_mm
-        x = self.offset_x_mm + square.col * pitch_mm + self.cell_size_mm / 2.0
+        machine_col = self._machine_col_for_square(square)
+        x = self.offset_x_mm + machine_col * pitch_mm + self.cell_size_mm / 2.0
         y = self.offset_y_mm + square.row * pitch_mm + self.cell_size_mm / 2.0
         return (x, y)
+
+    def _machine_col_for_square(self, square: Square) -> int:
+        if self.machine_label_orientation == MACHINE_LABEL_ORIENTATION_A1_TOP_RIGHT:
+            return self.board_size - 1 - square.col
+        if self.machine_label_orientation == MACHINE_LABEL_ORIENTATION_A1_TOP_LEFT:
+            return square.col
+        expected = ", ".join(sorted(VALID_MACHINE_LABEL_ORIENTATIONS))
+        raise ValueError(f"Machine label orientation must be one of: {expected}.")
 
     def cart_position_in_machine(self) -> tuple[float, float]:
         return (self.cart_x_mm, self.cart_y_mm)
@@ -123,9 +149,11 @@ class PlotterCalibration:
         return {
             "board_size": self.board_size,
             "label_orientation": self.label_orientation,
+            "machine_label_orientation": self.machine_label_orientation,
             "image_path": self.image_path,
             "image_corners": self.image_corners,
             "camera_index": self.camera_index,
+            "tile_rack_camera_index": self.tile_rack_camera_index,
             "offset_x_mm": self.offset_x_mm,
             "offset_y_mm": self.offset_y_mm,
             "cell_size_mm": self.cell_size_mm,
@@ -133,6 +161,9 @@ class PlotterCalibration:
             "y_steps_per_mm": self.y_steps_per_mm,
             "cart_x_mm": self.cart_x_mm,
             "cart_y_mm": self.cart_y_mm,
+            "tile_rack_x_mm": self.tile_rack_x_mm,
+            "tile_rack_y_mm": self.tile_rack_y_mm,
+            "tile_rack_pitch_mm": self.tile_rack_pitch_mm,
             "premium_layout": normalize_premium_layout(self.premium_layout, self.board_size),
             "ocr_confidence_threshold": self.ocr_confidence_threshold,
             "ocr_cell_size_px": self.ocr_cell_size_px,
@@ -140,6 +171,9 @@ class PlotterCalibration:
             "actuator_baud": self.actuator_baud,
             "actuator_timeout": self.actuator_timeout,
             "actuator_countdown_seconds": self.actuator_countdown_seconds,
+            "tile_cart_url": self.tile_cart_url,
+            "tile_cart_player_1_command": self.tile_cart_player_1_command,
+            "tile_cart_player_2_command": self.tile_cart_player_2_command,
         }
 
     @classmethod
@@ -147,9 +181,14 @@ class PlotterCalibration:
         return cls(
             board_size=int(payload.get("board_size", BOARD_SIZE)),
             label_orientation=payload.get("label_orientation", "A1-top-left"),
+            machine_label_orientation=payload.get(
+                "machine_label_orientation",
+                payload.get("label_orientation", MACHINE_LABEL_ORIENTATION_A1_TOP_LEFT),
+            ),
             image_path=payload.get("image_path"),
             image_corners=payload.get("image_corners", []),
             camera_index=int(payload.get("camera_index", 0)),
+            tile_rack_camera_index=int(payload.get("tile_rack_camera_index", 1)),
             offset_x_mm=float(payload.get("offset_x_mm", 0.0)),
             offset_y_mm=float(payload.get("offset_y_mm", 0.0)),
             cell_size_mm=float(payload.get("cell_size_mm", CELL_SIZE_MM)),
@@ -157,6 +196,9 @@ class PlotterCalibration:
             y_steps_per_mm=float(payload.get("y_steps_per_mm", 80.0)),
             cart_x_mm=float(payload.get("cart_x_mm", 0.0)),
             cart_y_mm=float(payload.get("cart_y_mm", 0.0)),
+            tile_rack_x_mm=float(payload.get("tile_rack_x_mm", 335.0)),
+            tile_rack_y_mm=float(payload.get("tile_rack_y_mm", 30.0)),
+            tile_rack_pitch_mm=float(payload.get("tile_rack_pitch_mm", 10.0)),
             premium_layout=normalize_premium_layout(
                 payload.get("premium_layout", default_premium_layout()),
                 int(payload.get("board_size", BOARD_SIZE)),
@@ -171,6 +213,9 @@ class PlotterCalibration:
             actuator_countdown_seconds=int(
                 payload.get("actuator_countdown_seconds", DEFAULT_ACTUATOR_COUNTDOWN_SECONDS)
             ),
+            tile_cart_url=str(payload.get("tile_cart_url") or "http://192.168.4.1"),
+            tile_cart_player_1_command=str(payload.get("tile_cart_player_1_command") or "backward"),
+            tile_cart_player_2_command=str(payload.get("tile_cart_player_2_command") or "forward"),
         )
 
     @classmethod

@@ -54,6 +54,8 @@ def collect_board_corners_from_frame(image) -> list[tuple[float, float]]:  # typ
 
     try:
         while True:
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                raise KeyboardInterrupt("Image calibration cancelled (window closed).")
             frame = display.copy()
             status = prompt[min(len(corners), 3)] if len(corners) < 4 else "Press Enter to confirm"
             cv2.putText(

@@ -160,11 +160,15 @@ def draw_camera_ocr_overlay(
     detected_words=None,
     detected_tiles=None,
     ocr_grid=None,
+    show_letters: bool = True,
+    show_word_labels: bool = True,
 ):  # type: ignore[no-untyped-def]
-    overlay = draw_camera_ocr_grid_overlay(frame, ocr_grid)
-    overlay = draw_captured_letters_overlay(overlay, captured_letters or [])
-    overlay = draw_detected_tiles_overlay(overlay, detected_tiles or [])
-    return draw_detected_words_overlay(overlay, detected_words or [])
+    overlay = frame.copy()
+    if show_letters:
+        overlay = draw_camera_ocr_grid_overlay(overlay, ocr_grid)
+        overlay = draw_captured_letters_overlay(overlay, captured_letters or [])
+        overlay = draw_detected_tiles_overlay(overlay, detected_tiles or [])
+    return draw_detected_words_overlay(overlay, detected_words or [], show_labels=show_word_labels)
 
 
 def draw_detected_tiles_overlay(frame, detected_tiles):  # type: ignore[no-untyped-def]
@@ -185,7 +189,7 @@ def draw_detected_tiles_overlay(frame, detected_tiles):  # type: ignore[no-untyp
     return overlay
 
 
-def draw_detected_words_overlay(frame, detected_words):  # type: ignore[no-untyped-def]
+def draw_detected_words_overlay(frame, detected_words, show_labels: bool = True):  # type: ignore[no-untyped-def]
     cv2 = _require_cv2()
     overlay = frame.copy()
     for index, detected in enumerate(detected_words, start=1):
@@ -197,7 +201,8 @@ def draw_detected_words_overlay(frame, detected_words):  # type: ignore[no-untyp
         if not word:
             continue
         cv2.rectangle(overlay, (x1, y1), (x2, y2), (80, 220, 255), 2, cv2.LINE_AA)
-        _draw_text_label(overlay, f"{index}. {word}", (x1, max(0, y1 - 26)), fill_color=(80, 220, 255))
+        if show_labels:
+            _draw_text_label(overlay, f"{index}. {word}", (x1, max(0, y1 - 26)), fill_color=(80, 220, 255))
     return overlay
 
 

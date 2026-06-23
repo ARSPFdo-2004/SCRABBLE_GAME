@@ -45,8 +45,8 @@ const bool INVERT_Y = true;
 const bool INVERT_Z = false;
 
 // Speed settings
-float maxSpeed = 3000.0;
-float acceleration =950.0;
+float maxSpeed = 5000.0;
+float acceleration = 400.0;
 
 // ================= Servo Settings =================
 Servo zServo;
@@ -253,9 +253,19 @@ void handleCommand(String cmd) {
   if (cmd.startsWith("G0") || cmd.startsWith("G1")) {
     float targetLetters = currentLettersMm;
     float targetNumbers = currentNumbersMm;
+    float targetFeed = maxSpeed;
 
     readWord(cmd, 'X', targetLetters);
     readWord(cmd, 'Y', targetNumbers);
+    
+    if (readWord(cmd, 'F', targetFeed)) {
+      if (targetFeed > 0) {
+        maxSpeed = targetFeed;
+        stepperX.setMaxSpeed(maxSpeed);
+        stepperY.setMaxSpeed(maxSpeed);
+        stepperZ.setMaxSpeed(maxSpeed);
+      }
+    }
 
     moveToBoardPosition(targetLetters, targetNumbers);
 

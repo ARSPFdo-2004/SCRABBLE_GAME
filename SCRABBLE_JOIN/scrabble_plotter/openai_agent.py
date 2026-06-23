@@ -4,11 +4,11 @@ import base64
 import json
 import re
 import urllib.error
-import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from .ai_player import AiMoveCandidate, AiMoveChoice
 from .board import BOARD_SIZE, parse_square_label
 from .calibration import PlotterCalibration
 from .word_bank import (
@@ -20,7 +20,7 @@ from .word_bank import (
 )
 
 
-GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 PLOTTER_ACTION_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -48,6 +48,15 @@ WORD_DETECTION_RESPONSE_SCHEMA = {
     },
     "required": ["words"],
 }
+AI_MOVE_CHOICE_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string"},
+        "candidate_id": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": ["action", "reason"],
+}
 
 
 @dataclass
@@ -59,10 +68,10 @@ class PlotterAgentAction:
     def validate(self) -> "PlotterAgentAction":
         allowed_actions = {"move_square", "go_cart", "reset", "none"}
         if self.action not in allowed_actions:
-            raise ValueError(f"Gemini returned unsupported action: {self.action}")
+            raise ValueError(f"OpenAI returned unsupported action: {self.action}")
         if self.action == "move_square":
             if not self.square:
-                raise ValueError("Gemini chose move_square without a square.")
+                raise ValueError("OpenAI chose move_square without a square.")
             self.square = parse_square_label(self.square).label
         else:
             self.square = None
@@ -78,7 +87,7 @@ class PlotterAgentAction:
 
 
 @dataclass(frozen=True)
-class GeminiDetectedWord:
+class OpenAIDetectedWord:
     word: str
     direction: str
     confidence: float = 0.0
@@ -95,21 +104,29 @@ class GeminiDetectedWord:
         }
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "GeminiDetectedWord":
+    def from_payload(cls, payload: dict[str, Any]) -> "OpenAIDetectedWord":
         word = _normalize_detected_word(payload.get("word", ""))
         direction = _normalize_word_direction(payload.get("direction", ""))
         confidence = _clamped_confidence(payload.get("confidence", 0.0))
         return cls(word=word, direction=direction, confidence=confidence)
 
 
-class GeminiPlotterAgent:
-    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
+class OpenAIPlotterAgent:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-4o-mini",
+        endpoint: str = DEFAULT_OPENAI_ENDPOINT,
+    ):
         if not api_key.strip():
-            raise ValueError("Enter a Gemini API key.")
+            raise ValueError("Enter an OpenAI API key.")
         if not model.strip():
-            raise ValueError("Enter a Gemini model name.")
+            raise ValueError("Enter an OpenAI model name.")
+        if not endpoint.strip():
+            raise ValueError("Enter an OpenAI endpoint.")
         self.api_key = api_key.strip()
         self.model = model.strip()
+        self.endpoint = normalize_openai_endpoint(endpoint)
 
     def decide(
         self,
@@ -119,24 +136,20 @@ class GeminiPlotterAgent:
         timeout: float = 20.0,
     ) -> PlotterAgentAction:
         prompt = self._build_prompt(objective, calibration)
-        parts: list[dict[str, Any]] = [{"text": prompt}]
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         if image_jpeg:
-            parts.append(
+            content.append(
                 {
-                    "inline_data": {
-                        "mime_type": "image/jpeg",
-                        "data": base64.b64encode(image_jpeg).decode("ascii"),
-                    }
+                    "type": "image_url",
+                    "image_url": {"url": _image_data_url(image_jpeg)},
                 }
             )
 
         request_payload = {
-            "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "responseMimeType": "application/json",
-                "responseJsonSchema": PLOTTER_ACTION_RESPONSE_SCHEMA,
-            },
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
         }
         response_payload = self._post(request_payload, timeout=timeout)
         text = _extract_text(response_payload)
@@ -147,40 +160,69 @@ class GeminiPlotterAgent:
         image_jpeg: bytes,
         captured_letters: str = "",
         timeout: float = 20.0,
-    ) -> list[GeminiDetectedWord]:
+    ) -> list[OpenAIDetectedWord]:
         if not image_jpeg:
-            raise ValueError("A camera image is required for Gemini word detection.")
+            raise ValueError("A camera image is required for OpenAI word detection.")
 
-        parts: list[dict[str, Any]] = [
-            {"text": self._build_word_prompt(captured_letters)},
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": self._build_word_prompt(captured_letters)},
             {
-                "inline_data": {
-                    "mime_type": "image/jpeg",
-                    "data": base64.b64encode(image_jpeg).decode("ascii"),
-                }
+                "type": "image_url",
+                "image_url": {"url": _image_data_url(image_jpeg)},
             },
         ]
         request_payload = {
-            "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {
-                "temperature": 0.0,
-                "responseMimeType": "application/json",
-                "responseJsonSchema": WORD_DETECTION_RESPONSE_SCHEMA,
-            },
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
         }
         response_payload = self._post(request_payload, timeout=timeout)
         text = _extract_text(response_payload)
         return parse_detected_words(_parse_json_object(text))
 
+    def choose_ai_move(
+        self,
+        candidates: list[AiMoveCandidate],
+        rack_letters: list[str],
+        objective: str = "",
+        timeout: float = 20.0,
+    ) -> AiMoveChoice:
+        if not candidates:
+            return AiMoveChoice(action="pass", reason="No legal moves were available.")
+
+        request_payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": self._build_ai_move_prompt(
+                                candidates,
+                                rack_letters,
+                                objective,
+                            )
+                        }
+                    ],
+                }
+            ],
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+        }
+        response_payload = self._post(request_payload, timeout=timeout)
+        text = _extract_text(response_payload)
+        return AiMoveChoice.from_payload(_parse_json_object(text), candidates)
+
     def _post(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
-        url = GEMINI_ENDPOINT.format(model=urllib.parse.quote(self.model, safe=""))
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
-            url,
+            self.endpoint,
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "x-goog-api-key": self.api_key,
+                "Authorization": f"Bearer {self.api_key}",
             },
             method="POST",
         )
@@ -190,10 +232,10 @@ class GeminiPlotterAgent:
         except urllib.error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace").strip()
             if details:
-                raise RuntimeError(f"Gemini request failed: HTTP {exc.code} {exc.reason}: {details}") from exc
-            raise RuntimeError(f"Gemini request failed: HTTP {exc.code} {exc.reason}") from exc
+                raise RuntimeError(f"OpenAI request failed: HTTP {exc.code} {exc.reason}: {details}") from exc
+            raise RuntimeError(f"OpenAI request failed: HTTP {exc.code} {exc.reason}") from exc
         except Exception as exc:
-            raise RuntimeError(f"Gemini request failed: {exc}") from exc
+            raise RuntimeError(f"OpenAI request failed: {exc}") from exc
 
     def _build_prompt(self, objective: str, calibration: PlotterCalibration) -> str:
         return (
@@ -231,16 +273,37 @@ class GeminiPlotterAgent:
             f"Local OCR captured these letters as extra context: {local_ocr}"
         )
 
+    def _build_ai_move_prompt(
+        self,
+        candidates: list[AiMoveCandidate],
+        rack_letters: list[str],
+        objective: str,
+    ) -> str:
+        candidate_payload = [candidate.to_prompt_dict() for candidate in candidates]
+        rack_text = "".join(letter or "-" for letter in rack_letters) or "empty"
+        return (
+            "You are Player 1 in a physical Scrabble-style game. "
+            "Choose exactly one legal move from the candidate list. "
+            "The app has already validated board bounds, rack slots, anchors, cross-words, and plotter safety. "
+            "Do not invent new words, squares, rack slots, G-code, motor steps, or coordinates.\n"
+            "Return exactly one JSON object and no extra text.\n"
+            'To play a move: {"action":"play","candidate_id":"C001","reason":"short reason"}\n'
+            'To pass: {"action":"pass","reason":"short reason"}\n'
+            f"Rack letters by slot TR1-TR7: {rack_text}\n"
+            f"User objective: {objective.strip() or 'Choose the best scoring legal move.'}\n"
+            "Legal candidates, ranked by local score:\n"
+            f"{json.dumps(candidate_payload, separators=(',', ':'))}"
+        )
+
 
 def _extract_text(payload: dict[str, Any]) -> str:
-    candidates = payload.get("candidates") or []
-    if not candidates:
-        raise ValueError("Gemini returned no candidates.")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    text_parts = [part.get("text", "") for part in parts if isinstance(part, dict)]
-    text = "\n".join(text_parts).strip()
+    choices = payload.get("choices") or []
+    if not choices:
+        raise ValueError("OpenAI returned no choices.")
+    message = choices[0].get("message", {})
+    text = str(message.get("content", "")).strip()
     if not text:
-        raise ValueError("Gemini returned an empty response.")
+        raise ValueError("OpenAI returned an empty response.")
     return text
 
 
@@ -257,22 +320,22 @@ def _parse_json_object(text: str) -> dict[str, Any]:
             raise
         payload = json.loads(match.group(0))
     if not isinstance(payload, dict):
-        raise ValueError("Gemini response must be a JSON object.")
+        raise ValueError("OpenAI response must be a JSON object.")
     return payload
 
 
-def parse_detected_words(payload: dict[str, Any]) -> list[GeminiDetectedWord]:
+def parse_detected_words(payload: dict[str, Any]) -> list[OpenAIDetectedWord]:
     raw_words = payload.get("words", [])
     if not isinstance(raw_words, list):
-        raise ValueError("Gemini word response must include a words list.")
+        raise ValueError("OpenAI word response must include a words list.")
 
-    words: list[GeminiDetectedWord] = []
+    words: list[OpenAIDetectedWord] = []
     seen: set[tuple[str, str]] = set()
     for raw_word in raw_words:
         if not isinstance(raw_word, dict):
             continue
         try:
-            detected = GeminiDetectedWord.from_payload(raw_word)
+            detected = OpenAIDetectedWord.from_payload(raw_word)
         except ValueError:
             continue
         key = (detected.word, detected.direction)
@@ -283,14 +346,14 @@ def parse_detected_words(payload: dict[str, Any]) -> list[GeminiDetectedWord]:
     return filter_matching_words(words)
 
 
-def format_detected_words_numbered(words: list[GeminiDetectedWord]) -> str:
+def format_detected_words_numbered(words: list[OpenAIDetectedWord]) -> str:
     return format_words_by_direction(words)
 
 
 def _normalize_detected_word(value: Any) -> str:
     word = "".join(char for char in str(value).strip().upper() if "A" <= char <= "Z")
     if len(word) < 2:
-        raise ValueError("Gemini word must contain at least two letters.")
+        raise ValueError("OpenAI word must contain at least two letters.")
     return word
 
 
@@ -306,7 +369,7 @@ def _normalize_word_direction(value: Any) -> str:
     }
     direction = aliases.get(normalized)
     if direction is None:
-        raise ValueError(f"Unsupported Gemini word direction: {value}")
+        raise ValueError(f"Unsupported OpenAI word direction: {value}")
     return direction
 
 
@@ -318,3 +381,16 @@ def _clamped_confidence(value: Any) -> float:
     if 0.0 < confidence <= 1.0:
         confidence *= 100.0
     return min(100.0, max(0.0, confidence))
+
+
+def normalize_openai_endpoint(endpoint: str) -> str:
+    cleaned = endpoint.strip().rstrip("/")
+    if cleaned.endswith("/chat/completions"):
+        return cleaned
+    if cleaned.endswith("/v1"):
+        return cleaned + "/chat/completions"
+    return cleaned
+
+
+def _image_data_url(image_jpeg: bytes) -> str:
+    return "data:image/jpeg;base64," + base64.b64encode(image_jpeg).decode("ascii")

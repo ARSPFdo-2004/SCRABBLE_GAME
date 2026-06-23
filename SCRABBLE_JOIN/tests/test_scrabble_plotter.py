@@ -4,8 +4,17 @@ import json
 from pathlib import Path
 import unittest
 
+from scrabble_plotter.ai_player import (
+    AiMoveCandidate,
+    AiMoveChoice,
+    HORIZONTAL,
+    VERTICAL,
+    generate_ai_move_candidates,
+    top_ai_move_candidates,
+)
 from scrabble_plotter.board import BOARD_SIZE, CELL_SIZE_MM, parse_square_label
 from scrabble_plotter.calibration import (
+    MACHINE_LABEL_ORIENTATION_A1_TOP_RIGHT,
     PREMIUM_DOUBLE_LETTER,
     PREMIUM_DOUBLE_WORD,
     PlotterCalibration,
@@ -13,11 +22,13 @@ from scrabble_plotter.calibration import (
     resolve_stored_path,
 )
 from scrabble_plotter.camera import open_camera_capture, read_camera_frame
-from scrabble_plotter.gemini_agent import (
-    GeminiDetectedWord,
+from scrabble_plotter.openai_agent import (
+    OpenAIDetectedWord,
+    OpenAIPlotterAgent,
     PlotterAgentAction,
     _parse_json_object,
     format_detected_words_numbered,
+    normalize_openai_endpoint,
     parse_detected_words,
 )
 from scrabble_plotter.gui import (
@@ -113,6 +124,15 @@ class PlotterCalibrationTests(unittest.TestCase):
         self.assertEqual(calibration.square_center_in_machine(parse_square_label("A1")), (25.0, 35.0))
         self.assertEqual(calibration.square_center_in_machine(parse_square_label("L12")), (355.0, 365.0))
 
+    def test_machine_label_orientation_can_mirror_columns(self) -> None:
+        calibration = PlotterCalibration(
+            machine_label_orientation=MACHINE_LABEL_ORIENTATION_A1_TOP_RIGHT,
+        )
+
+        self.assertEqual(calibration.square_center_in_machine(parse_square_label("A1")), (345.0, 15.0))
+        self.assertEqual(calibration.square_center_in_machine(parse_square_label("L1")), (15.0, 15.0))
+        self.assertEqual(calibration.square_center_in_machine(parse_square_label("A2")), (345.0, 45.0))
+
     def test_fixed_coordinate_mapping_with_custom_cell_size(self) -> None:
         calibration = PlotterCalibration(offset_x_mm=10.0, offset_y_mm=20.0, cell_size_mm=25.0)
 
@@ -122,11 +142,15 @@ class PlotterCalibrationTests(unittest.TestCase):
     def test_persistence_round_trip(self) -> None:
         calibration = PlotterCalibration(
             camera_index=2,
+            tile_rack_camera_index=3,
             offset_x_mm=12.5,
             offset_y_mm=24.5,
             cell_size_mm=25.0,
             cart_x_mm=111.0,
             cart_y_mm=222.0,
+            tile_cart_url="192.168.4.1",
+            tile_cart_player_1_command="backward",
+            tile_cart_player_2_command="forward",
             image_corners=[[0.0, 0.0], [360.0, 0.0], [360.0, 360.0], [0.0, 360.0]],
         )
 
@@ -136,12 +160,17 @@ class PlotterCalibrationTests(unittest.TestCase):
         self.assertEqual(loaded.board_size, BOARD_SIZE)
         self.assertEqual(loaded.cell_size_mm, 25.0)
         self.assertEqual(loaded.camera_index, 2)
+        self.assertEqual(loaded.tile_rack_camera_index, 3)
         self.assertEqual(loaded.offset_x_mm, 12.5)
         self.assertEqual(loaded.offset_y_mm, 24.5)
+        self.assertEqual(loaded.machine_label_orientation, "A1-top-left")
         self.assertEqual(loaded.x_steps_per_mm, 80.0)
         self.assertEqual(loaded.y_steps_per_mm, 80.0)
         self.assertEqual(loaded.cart_x_mm, 111.0)
         self.assertEqual(loaded.cart_y_mm, 222.0)
+        self.assertEqual(loaded.tile_cart_url, "192.168.4.1")
+        self.assertEqual(loaded.tile_cart_player_1_command, "backward")
+        self.assertEqual(loaded.tile_cart_player_2_command, "forward")
         self.assertEqual(len(loaded.image_corners), 4)
 
     def test_persistence_round_trip_includes_step_settings(self) -> None:
@@ -155,6 +184,17 @@ class PlotterCalibrationTests(unittest.TestCase):
 
         self.assertEqual(loaded.x_steps_per_mm, 100.0)
         self.assertEqual(loaded.y_steps_per_mm, 200.0)
+
+    def test_persistence_round_trip_includes_machine_label_orientation(self) -> None:
+        calibration = PlotterCalibration(
+            machine_label_orientation=MACHINE_LABEL_ORIENTATION_A1_TOP_RIGHT,
+        )
+
+        payload = json.loads(json.dumps(calibration.to_dict()))
+        loaded = PlotterCalibration.from_dict(payload)
+
+        self.assertEqual(loaded.machine_label_orientation, MACHINE_LABEL_ORIENTATION_A1_TOP_RIGHT)
+        self.assertEqual(loaded.square_center_in_machine(parse_square_label("A1")), (345.0, 15.0))
 
     def test_persistence_round_trip_includes_scan_settings(self) -> None:
         layout = [[PREMIUM_DOUBLE_WORD if row == col else "normal" for col in range(BOARD_SIZE)] for row in range(BOARD_SIZE)]
@@ -299,7 +339,86 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(result.words[0].score, 1)
 
 
+class AiPlayerTests(unittest.TestCase):
+    def _empty_board(self) -> list[list[str]]:
+        return [["" for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+
+    def test_empty_board_opening_can_be_any_contiguous_rack_word(self) -> None:
+        candidates = top_ai_move_candidates(
+            self._empty_board(),
+            ["C", "A", "T"],
+            words=["CAT"],
+        )
+
+        self.assertTrue(candidates)
+        first = candidates[0]
+        self.assertEqual((first.candidate_id, first.word, first.direction, first.start_square, first.end_square), ("C001", "CAT", HORIZONTAL, "A1", "C1"))
+        self.assertEqual([(placement.rack_label, placement.square) for placement in first.placements], [("TR1", "A1"), ("TR2", "B1"), ("TR3", "C1")])
+
+    def test_non_empty_board_reuses_existing_anchor_letter(self) -> None:
+        board = self._empty_board()
+        board[0][0] = "C"
+        board[0][1] = "A"
+
+        candidates = generate_ai_move_candidates(board, ["T"], words=["CAT"])
+        anchored = [candidate for candidate in candidates if candidate.word == "CAT" and candidate.start_square == "A1"]
+
+        self.assertEqual(len(anchored), 1)
+        self.assertEqual([(placement.rack_label, placement.square, placement.letter) for placement in anchored[0].placements], [("TR1", "C1", "T")])
+
+    def test_cross_words_must_match_reference_words(self) -> None:
+        board = self._empty_board()
+        board[0][1] = "Z"
+
+        invalid = generate_ai_move_candidates(board, ["C", "A", "T"], words=["CAT"])
+        valid = generate_ai_move_candidates(board, ["C", "A", "T"], words=["CAT", "ZA"])
+
+        self.assertEqual(invalid, [])
+        self.assertTrue(any(candidate.word == "CAT" and "ZA" in candidate.cross_words for candidate in valid))
+
+    def test_occupied_square_conflict_is_rejected(self) -> None:
+        board = self._empty_board()
+        board[0][0] = "D"
+
+        candidates = generate_ai_move_candidates(board, ["C", "A", "T"], words=["CAT"])
+
+        self.assertEqual(candidates, [])
+
+    def test_duplicate_rack_letters_use_distinct_slots(self) -> None:
+        candidates = top_ai_move_candidates(
+            self._empty_board(),
+            ["A", "A"],
+            words=["AA"],
+        )
+
+        self.assertTrue(candidates)
+        self.assertEqual([placement.rack_label for placement in candidates[0].placements], ["TR1", "TR2"])
+
+    def test_no_candidate_when_rack_cannot_make_word(self) -> None:
+        candidates = generate_ai_move_candidates(
+            self._empty_board(),
+            ["Z"],
+            words=["CAT"],
+        )
+
+        self.assertEqual(candidates, [])
+
+
 class CameraTests(unittest.TestCase):
+    def test_word_detection_board_mask_keeps_only_calibrated_area(self) -> None:
+        import numpy as np
+
+        app = object.__new__(ScrabblePlotterApp)
+        app._calibration = PlotterCalibration(
+            image_corners=[[20.0, 20.0], [80.0, 20.0], [80.0, 80.0], [20.0, 80.0]]
+        )
+        frame = np.full((100, 100, 3), 200, dtype=np.uint8)
+
+        masked = ScrabblePlotterApp._frame_limited_to_calibrated_board(app, frame)
+
+        self.assertEqual(masked[50, 50].tolist(), [200, 200, 200])
+        self.assertEqual(masked[10, 10].tolist(), [0, 0, 0])
+
     def test_read_camera_frame_retries_until_usable_frame(self) -> None:
         frame = _FakeFrame()
         camera = _FakeCapture(
@@ -516,6 +635,18 @@ class ScannerTests(unittest.TestCase):
             ],
         )
 
+    def test_letter_runs_do_not_jump_over_blank_sized_gaps(self) -> None:
+        boxes = [
+            _paddle_box("C", 92, 12, 20),
+            _paddle_box("T", 86, 72, 20),
+            _paddle_box("D", 94, 150, 12),
+            _paddle_box("G", 89, 150, 72),
+        ]
+
+        words = identify_directional_words(boxes)
+
+        self.assertEqual(words, [])
+
     def test_identifies_words_from_individual_tiles(self) -> None:
         tiles = [
             _camera_tile("C", 92, 12, 20),
@@ -535,6 +666,16 @@ class ScannerTests(unittest.TestCase):
                 ("DOG", "vertical_top_to_bottom"),
             ],
         )
+
+    def test_tile_words_do_not_jump_over_blank_sized_gaps(self) -> None:
+        tiles = [
+            _camera_tile("C", 92, 12, 20),
+            _camera_tile("T", 86, 72, 20),
+        ]
+
+        words = identify_directional_tile_words(tiles)
+
+        self.assertEqual(words, [])
 
     def test_generated_reference_word_bank_contains_1000_words(self) -> None:
         words = generated_reference_words()
@@ -657,6 +798,20 @@ class ScannerTests(unittest.TestCase):
 
         self.assertEqual([box.text for box in scan.text_boxes], ["CAT", "ZZQ"])
         self.assertEqual([(word.word, word.direction) for word in scan.words], [("CAT", "horizontal_left_to_right")])
+
+    def test_scan_camera_words_suppresses_contained_partial_words(self) -> None:
+        image = _synthetic_multi_word_white_on_black_text_image()
+
+        scan = scan_camera_words(
+            image,
+            confidence_threshold=50.0,
+            ocr_reader=lambda frame: [
+                _easyocr_result("CUT", 0.91, 18, 30, 85, 40),
+                _easyocr_result("UT", 0.88, 50, 30, 54, 40),
+            ],
+        )
+
+        self.assertEqual([(word.word, word.direction) for word in scan.words], [("CUT", "horizontal_left_to_right")])
 
     def test_format_camera_words_as_numbered_list(self) -> None:
         text = format_camera_words_numbered(
@@ -792,7 +947,19 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(square_label(11, 11), "L12")
 
 
-class GeminiAgentTests(unittest.TestCase):
+class OpenAIAgentTests(unittest.TestCase):
+    def _candidate(self, candidate_id: str = "C001") -> AiMoveCandidate:
+        return AiMoveCandidate(
+            candidate_id=candidate_id,
+            word="CAT",
+            direction=HORIZONTAL,
+            start_row=0,
+            start_col=0,
+            score=5,
+            placements=(),
+            squares=("A1", "B1", "C1"),
+        )
+
     def test_agent_action_accepts_valid_square(self) -> None:
         action = PlotterAgentAction.from_payload(
             {"action": "move_square", "square": "a1", "reason": "target selected"}
@@ -839,8 +1006,8 @@ class GeminiAgentTests(unittest.TestCase):
     def test_format_detected_words_as_numbered_list(self) -> None:
         text = format_detected_words_numbered(
             [
-                GeminiDetectedWord("CAT", "horizontal_left_to_right", 92.0),
-                GeminiDetectedWord("DOG", "vertical_top_to_bottom", 88.0),
+                OpenAIDetectedWord("CAT", "horizontal_left_to_right", 92.0),
+                OpenAIDetectedWord("DOG", "vertical_top_to_bottom", 88.0),
             ]
         )
 
@@ -851,6 +1018,58 @@ class GeminiAgentTests(unittest.TestCase):
             "\n"
             "Vertical top-to-bottom:\n"
             "1. DOG (88%)",
+        )
+
+    def test_choose_ai_move_accepts_valid_candidate_id(self) -> None:
+        class Agent(OpenAIPlotterAgent):
+            def _post(self, payload, timeout):  # type: ignore[no-untyped-def]
+                self.payload = payload
+                return {"choices": [{"message": {"content": '{"action":"play","candidate_id":"C001","reason":"best"}'}}]}
+
+        agent = Agent("key")
+        candidate = self._candidate("C001")
+
+        choice = agent.choose_ai_move([candidate], ["C", "A", "T"])
+
+        self.assertEqual(choice.action, "play")
+        self.assertIs(choice.candidate, candidate)
+        self.assertEqual(choice.reason, "best")
+
+    def test_choose_ai_move_accepts_pass(self) -> None:
+        class Agent(OpenAIPlotterAgent):
+            def _post(self, payload, timeout):  # type: ignore[no-untyped-def]
+                return {"choices": [{"message": {"content": '{"action":"pass","reason":"no good move"}'}}]}
+
+        choice = Agent("key").choose_ai_move([self._candidate()], ["C", "A", "T"])
+
+        self.assertEqual(choice.action, "pass")
+        self.assertIsNone(choice.candidate)
+        self.assertEqual(choice.reason, "no good move")
+
+    def test_choose_ai_move_rejects_unknown_candidate_id(self) -> None:
+        class Agent(OpenAIPlotterAgent):
+            def _post(self, payload, timeout):  # type: ignore[no-untyped-def]
+                return {"choices": [{"message": {"content": '{"action":"play","candidate_id":"C999","reason":"bad"}'}}]}
+
+        with self.assertRaisesRegex(ValueError, "unknown candidate"):
+            Agent("key").choose_ai_move([self._candidate()], ["C", "A", "T"])
+
+    def test_choose_ai_move_rejects_malformed_json(self) -> None:
+        class Agent(OpenAIPlotterAgent):
+            def _post(self, payload, timeout):  # type: ignore[no-untyped-def]
+                return {"choices": [{"message": {"content": "not json"}}]}
+
+        with self.assertRaises(json.JSONDecodeError):
+            Agent("key").choose_ai_move([self._candidate()], ["C", "A", "T"])
+
+    def test_choose_ai_move_requires_api_key(self) -> None:
+        with self.assertRaisesRegex(ValueError, "OpenAI API key"):
+            OpenAIPlotterAgent("")
+
+    def test_endpoint_normalization_accepts_base_v1_url(self) -> None:
+        self.assertEqual(
+            normalize_openai_endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/chat/completions",
         )
 
 
@@ -1017,6 +1236,75 @@ class PickDropTests(unittest.TestCase):
 
         self.assertEqual(app.calls, [("aux", "ZU")])
 
+    def test_tile_rack_move_uses_plotter_sender_not_actuator_sender(self) -> None:
+        class Sender:
+            def __init__(self) -> None:
+                self.commands = []
+
+            def send_command(self, command: str) -> list[str]:
+                self.commands.append(command)
+                return ["ok"]
+
+        app = object.__new__(ScrabblePlotterApp)
+        sender = Sender()
+        app.logs = []
+        app._serial_config = lambda: SerialConfig("COM5", 115200, 0.01, False)
+        app._get_sender_for_config = lambda config: sender
+        app._send_actuator_command = lambda command: (_ for _ in ()).throw(
+            AssertionError("rack movement must not use the board actuator")
+        )
+        app._send_auxiliary_command = lambda command: (_ for _ in ()).throw(
+            AssertionError("rack movement must not use auxiliary Z/magnet sender")
+        )
+        app._log = app.logs.append
+
+        ScrabblePlotterApp._send_tile_rack_move_command(app, "G0 X335 Y30 F1500")
+
+        self.assertEqual(sender.commands, ["G0 X335 Y30 F1500"])
+
+    def test_tile_rack_move_raises_on_plotter_controller_error(self) -> None:
+        class Sender:
+            def send_command(self, command: str) -> list[str]:
+                return ["err unknown command"]
+
+        app = object.__new__(ScrabblePlotterApp)
+        app.logs = []
+        app._serial_config = lambda: SerialConfig("COM5", 115200, 0.01, False)
+        app._get_sender_for_config = lambda config: Sender()
+        app._log = app.logs.append
+
+        with self.assertRaisesRegex(RuntimeError, "err unknown command"):
+            ScrabblePlotterApp._send_tile_rack_move_command(app, "G0 X335 Y30 F1500")
+
+    def test_pick_drop_stops_after_failed_step(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._pick_drop_running = True
+        app.statuses = []
+        app.logs = []
+        app.errors = []
+        app.delays = []
+
+        class ImmediateRoot:
+            def after(self, delay, callback):  # type: ignore[no-untyped-def]
+                app.delays.append(delay)
+                callback()
+
+        app.root = ImmediateRoot()
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+        app._show_error = app.errors.append
+        steps = [
+            ("Move to pickup TR1", lambda: (_ for _ in ()).throw(RuntimeError("controller failed"))),
+            ("Z down", lambda: (_ for _ in ()).throw(AssertionError("sequence should stop"))),
+        ]
+
+        ScrabblePlotterApp._run_pick_drop_steps(app, steps, "H8")
+
+        self.assertFalse(app._pick_drop_running)
+        self.assertEqual(len(app.errors), 1)
+        self.assertIn("controller failed", str(app.errors[0]))
+        self.assertEqual(app.delays, [])
+
 
 class SerialSenderTests(unittest.TestCase):
     def test_auxiliary_command_can_reuse_open_connection_without_startup_g90(self) -> None:
@@ -1098,6 +1386,324 @@ class SerialSenderTests(unittest.TestCase):
 
         self.assertEqual(connection.writes, ["LED_CELLS A1,C10\n"])
         self.assertEqual(responses, ["ok led cells 2"])
+
+
+class GameStateTests(unittest.TestCase):
+    def test_tile_cart_url_for_command_adds_http_and_route(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.tile_cart_url_var = _FakeVar("192.168.4.1")
+
+        url = ScrabblePlotterApp._tile_cart_url_for_command(app, "forward")
+
+        self.assertEqual(url, "http://192.168.4.1/forward")
+
+    def test_tile_cart_rejects_unknown_command(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.tile_cart_url_var = _FakeVar("http://192.168.4.1")
+
+        with self.assertRaisesRegex(ValueError, "forward, backward, or stop"):
+            ScrabblePlotterApp._tile_cart_url_for_command(app, "left")
+
+    def _game_app(self):
+        app = object.__new__(ScrabblePlotterApp)
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app._player_1_cells = set()
+        app._player_2_cells = set()
+        app._player_1_words = []
+        app._player_2_words = []
+        app._current_player = 1
+        app._previous_board_state = {}
+        app._turn_start_board_state = {}
+        app._turn_scan_started_state = {}
+        app._turn_scan_switch_after = False
+        app._turn_scan_detected_words = []
+        app._pending_turn_scan = False
+        app._current_player_display_var = _FakeVar("Current Player: 1")
+        app.logs = []
+        app.table_updates = []
+        app.start_turns = []
+        app._log = app.logs.append
+        app._update_words_table = lambda: app.table_updates.append((list(app._player_1_words), list(app._player_2_words)))
+        app._update_grid_colors = lambda: None
+        app._start_turn = lambda: app.start_turns.append(app._current_player)
+        app._calibration_from_form = lambda: PlotterCalibration()
+        app._blank_squares_from_form = lambda: set()
+        return app
+
+    def test_assign_words_uses_turn_start_snapshot_for_correct_player(self) -> None:
+        app = self._game_app()
+        app._letter_vars[0][0].set("C")
+        app._letter_vars[0][1].set("A")
+        app._letter_vars[0][2].set("T")
+        app._letter_vars[1][4].set("D")
+        app._letter_vars[2][4].set("O")
+        app._letter_vars[3][4].set("G")
+        previous_state = {"A1": "C", "B1": "A", "C1": "T"}
+
+        ScrabblePlotterApp._assign_new_words_to_current_player(app, 2, previous_state=previous_state)
+
+        self.assertEqual(app._player_1_words, [])
+        self.assertEqual(app._player_2_words, ["DOG"])
+        self.assertEqual(app._player_2_cells, {"E2", "E3", "E4"})
+        self.assertNotIn("CAT", app._player_2_words)
+
+    def test_assign_uses_current_scan_detected_words_when_board_scoring_misses_them(self) -> None:
+        app = self._game_app()
+        app._turn_scan_detected_words = ["DOG"]
+
+        ScrabblePlotterApp._assign_new_words_to_current_player(app, 2, previous_state={})
+
+        self.assertEqual(app._player_1_words, [])
+        self.assertEqual(app._player_2_words, ["DOG"])
+        self.assertEqual(app.table_updates, [([], ["DOG"])])
+
+    def test_detected_scan_words_do_not_duplicate_existing_player_words(self) -> None:
+        app = self._game_app()
+        app._player_1_words = ["CAT"]
+        app._turn_scan_detected_words = ["CAT", "DOG"]
+
+        ScrabblePlotterApp._assign_new_words_to_current_player(app, 2, previous_state={})
+
+        self.assertEqual(app._player_1_words, ["CAT"])
+        self.assertEqual(app._player_2_words, ["DOG"])
+
+    def test_scan_start_captures_current_player_two(self) -> None:
+        app = self._game_app()
+        app._current_player = 2
+        app._current_player_display_var.set("Current Player: 2")
+        app._previous_board_state = {"A1": "C"}
+        app._turn_start_board_state = {"A1": "C"}
+
+        player_id = ScrabblePlotterApp._begin_player_scan(app, switch_after_scan=True)
+
+        self.assertEqual(player_id, 2)
+        self.assertTrue(app._pending_turn_scan)
+        self.assertEqual(app._turn_scan_player, 2)
+        self.assertTrue(app._turn_scan_switch_after)
+        self.assertEqual(app._turn_scan_started_state, {"A1": "C"})
+
+    def test_turn_scan_complete_assigns_to_captured_player_two(self) -> None:
+        app = self._game_app()
+        app._current_player = 2
+        app._turn_scan_player = 2
+        app._turn_scan_switch_after = True
+        app._turn_scan_started_state = {}
+        app._letter_vars[1][4].set("D")
+        app._letter_vars[2][4].set("O")
+        app._letter_vars[3][4].set("G")
+
+        ScrabblePlotterApp._on_turn_scan_complete(app)
+
+        self.assertEqual(app._player_1_words, [])
+        self.assertEqual(app._player_2_words, ["DOG"])
+        self.assertEqual(app._current_player, 1)
+        self.assertEqual(app.start_turns, [1])
+
+
+class AiPlayerGuiTests(unittest.TestCase):
+    def _candidate(self) -> AiMoveCandidate:
+        from scrabble_plotter.ai_player import AiPlacement
+
+        return AiMoveCandidate(
+            candidate_id="C001",
+            word="CAT",
+            direction=HORIZONTAL,
+            start_row=0,
+            start_col=0,
+            score=5,
+            placements=(
+                AiPlacement(rack_slot=1, letter="C", row=0, col=0),
+                AiPlacement(rack_slot=2, letter="A", row=0, col=1),
+                AiPlacement(rack_slot=3, letter="T", row=0, col=2),
+            ),
+            squares=("A1", "B1", "C1"),
+        )
+
+    def _turn_app(self, player: int = 1):
+        app = object.__new__(ScrabblePlotterApp)
+        app._current_player = player
+        app._current_player_display_var = _FakeVar(f"Current Player: {player}")
+        app._previous_board_state = {}
+        app._turn_start_board_state = {}
+        app._timer_running = True
+        app._ai_player_running = False
+        app._pick_drop_running = False
+        app._ai_turn_after_id = None
+        app.player_1_ai_enabled_var = _FakeVar("1")
+        app.scheduled = []
+
+        class Root:
+            def after(self, delay, callback):  # type: ignore[no-untyped-def]
+                app.scheduled.append((delay, callback))
+                return "after-ai"
+
+        app.root = Root()
+        return app
+
+    def test_player_one_turn_schedules_ai_when_enabled(self) -> None:
+        app = self._turn_app(player=1)
+
+        ScrabblePlotterApp._start_turn(app)
+
+        self.assertEqual(len(app.scheduled), 1)
+        self.assertEqual(app.scheduled[0][0], 700)
+        self.assertEqual(app._ai_turn_after_id, "after-ai")
+
+    def test_player_two_turn_does_not_schedule_ai(self) -> None:
+        app = self._turn_app(player=2)
+
+        ScrabblePlotterApp._start_turn(app)
+
+        self.assertEqual(app.scheduled, [])
+
+    def test_ai_pick_drop_steps_use_each_rack_slot_and_square_in_order(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.z_height_angle = _FakeVar("80")
+        app.calls = []
+        app._send_pick_drop_ordered_command = lambda command: app.calls.append(("command", command))
+        app._send_pick_drop_ordered_target_move = lambda target: app.calls.append(("move", target))
+        app._send_pick_drop_ordered_reset = lambda: app.calls.append(("reset", "HOMEZERO"))
+
+        steps = ScrabblePlotterApp._ai_pick_drop_steps(app, self._candidate())
+        for _label, action in steps:
+            action()
+
+        self.assertEqual(
+            app.calls,
+            [
+                ("command", "ZH80"),
+                ("command", Z_UP_COMMAND),
+                ("move", "TR1"),
+                ("command", Z_DOWN_COMMAND),
+                ("command", "M1"),
+                ("command", Z_UP_COMMAND),
+                ("move", "A1"),
+                ("command", Z_DOWN_COMMAND),
+                ("command", "M0"),
+                ("command", Z_UP_COMMAND),
+                ("command", Z_UP_COMMAND),
+                ("move", "TR2"),
+                ("command", Z_DOWN_COMMAND),
+                ("command", "M1"),
+                ("command", Z_UP_COMMAND),
+                ("move", "B1"),
+                ("command", Z_DOWN_COMMAND),
+                ("command", "M0"),
+                ("command", Z_UP_COMMAND),
+                ("command", Z_UP_COMMAND),
+                ("move", "TR3"),
+                ("command", Z_DOWN_COMMAND),
+                ("command", "M1"),
+                ("command", Z_UP_COMMAND),
+                ("move", "C1"),
+                ("command", Z_DOWN_COMMAND),
+                ("command", "M0"),
+                ("command", Z_UP_COMMAND),
+                ("reset", "HOMEZERO"),
+            ],
+        )
+
+    def test_ai_success_updates_board_clears_rack_and_switches_to_player_two(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._letter_vars = [[_FakeVar("") for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+        app.tile_rack_letter_vars = [_FakeVar(letter) for letter in ["C", "A", "T", "", "", "", ""]]
+        app._player_1_cells = set()
+        app._player_2_cells = set()
+        app._player_1_words = []
+        app._player_2_words = []
+        app._previous_board_state = {}
+        app._turn_start_board_state = {}
+        app._turn_scan_started_state = {}
+        app._turn_scan_detected_words = []
+        app._pending_turn_scan = False
+        app._ai_player_running = True
+        app._pick_drop_running = True
+        app._pending_ai_move_candidate = self._candidate()
+        app._current_player = 1
+        app._current_player_display_var = _FakeVar("Current Player: 1")
+        app.starts = []
+        app.statuses = []
+        app.logs = []
+        app._calibration_from_form = lambda: PlotterCalibration()
+        app._blank_squares_from_form = lambda: set()
+        app._update_grid_colors = lambda: None
+        app._update_words_table = lambda: None
+        app._set_status = app.statuses.append
+        app._log = app.logs.append
+        app._start_turn = lambda: app.starts.append(app._current_player)
+
+        ScrabblePlotterApp._finish_ai_move_success(app, self._candidate())
+
+        self.assertEqual([app._letter_vars[0][col].get() for col in range(3)], ["C", "A", "T"])
+        self.assertEqual([variable.get() for variable in app.tile_rack_letter_vars[:3]], ["", "", ""])
+        self.assertEqual(app._player_1_words, ["CAT"])
+        self.assertEqual(app._current_player, 2)
+        self.assertEqual(app.starts, [2])
+
+    def test_ai_pick_drop_failure_leaves_turn_on_player_one(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app._current_player = 1
+        app._ai_player_running = True
+        app._pick_drop_running = True
+        app._pending_ai_move_candidate = self._candidate()
+        app.errors = []
+        app._show_error = app.errors.append
+
+        ScrabblePlotterApp._handle_pick_drop_step_error(app, RuntimeError("controller failed"))
+
+        self.assertFalse(app._ai_player_running)
+        self.assertFalse(app._pick_drop_running)
+        self.assertEqual(app._current_player, 1)
+        self.assertEqual(len(app.errors), 1)
+
+    def test_manual_rack_letters_normalize_for_ai(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.tile_rack_letter_vars = [_FakeVar(value) for value in ["c", "aa", "7", "T", "", "z!", "q"]]
+        app.tile_rack_word_suggestions_var = _FakeVar("")
+        app._tile_rack_move_state_ready = True
+
+        ScrabblePlotterApp._normalize_tile_rack_letter_entries(app)
+
+        self.assertEqual([variable.get() for variable in app.tile_rack_letter_vars], ["C", "A", "", "T", "", "Z", "Q"])
+        self.assertEqual(ScrabblePlotterApp._ai_rack_letters(app), ["C", "A", "", "T", "", "Z", "Q"])
+
+    def test_rack_scan_updates_visible_tile_rack_grid(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.tile_rack_letter_vars = [_FakeVar("") for _ in range(7)]
+        app.tile_rack_word_suggestions_var = _FakeVar("")
+        app.tile_rack_status_var = _FakeVar("")
+        app._tile_rack_move_state_ready = True
+        app._tile_rack_calibrated_corners = [(0.0, 0.0), (10.0, 0.0), (10.0, 70.0), (0.0, 70.0)]
+        app._tile_rack_letters_from_camera = lambda frame, scan: ["C", "A", "T", "", "", "", ""]
+        app._tile_rack_slot_position = lambda index: (100.0, 20.0 + index)
+        app.logs = []
+        app._log = app.logs.append
+        app._refresh_camera_preview = lambda: None
+
+        count = ScrabblePlotterApp._update_tile_rack_letters_from_scan(
+            app,
+            object(),
+            CameraLetterScanResult(letters=[], grid=None),
+            source="test scan",
+        )
+
+        self.assertEqual(count, 3)
+        self.assertEqual([variable.get() for variable in app.tile_rack_letter_vars[:3]], ["C", "A", "T"])
+        self.assertIn("TR1: C", app.tile_rack_status_var.get())
+
+    def test_clear_manual_rack_letters(self) -> None:
+        app = object.__new__(ScrabblePlotterApp)
+        app.tile_rack_letter_vars = [_FakeVar(value) for value in ["C", "A", "T", "", "", "", ""]]
+        app.tile_rack_word_suggestions_var = _FakeVar("old")
+        app._tile_rack_move_state_ready = True
+        app.statuses = []
+        app._set_status = app.statuses.append
+
+        ScrabblePlotterApp.clear_tile_rack_letters(app)
+
+        self.assertEqual([variable.get() for variable in app.tile_rack_letter_vars], ["", "", "", "", "", "", ""])
+        self.assertEqual(app.tile_rack_word_suggestions_var.get(), "")
+        self.assertEqual(app.statuses[-1], "Rack letters cleared.")
 
 
 class BoardActuatorGuiTests(unittest.TestCase):
