@@ -1,4 +1,4 @@
-# Scrabble Join
+w# Scrabble Join
 
 This folder contains the joined desktop app for the Scrabble project.
 

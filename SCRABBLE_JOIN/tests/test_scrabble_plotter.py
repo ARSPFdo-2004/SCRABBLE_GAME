@@ -40,7 +40,7 @@ from scrabble_plotter.gui import (
     Z_UP_COMMAND,
 )
 from scrabble_plotter.main import build_parser
-from scrabble_plotter.overlay import cell_label_positions, grid_segments, project_board_points
+from scrabble_plotter.overlay import cell_label_positions, draw_camera_ocr_grid_overlay, grid_segments, project_board_points
 from scrabble_plotter.scanner import (
     CameraLetterScanResult,
     CameraGridCell,
@@ -279,6 +279,19 @@ class OverlayTests(unittest.TestCase):
         labels = dict(cell_label_positions(corners))
         self.assertEqual(labels["A1"], (15.0, 15.0))
         self.assertEqual(labels["L12"], (345.0, 345.0))
+
+    def test_camera_ocr_grid_overlay_draws_confident_letters(self) -> None:
+        import numpy as np
+
+        image = np.zeros((360, 360, 3), dtype=np.uint8)
+        grid = CameraOcrGrid(
+            corners=[(0.0, 0.0), (360.0, 0.0), (360.0, 360.0), (0.0, 360.0)],
+            cells=[CameraGridCell(row=0, col=0, square="A1", letter="C", confidence=87.0, source="test")],
+        )
+
+        overlay = draw_camera_ocr_grid_overlay(image, grid)
+
+        self.assertGreater(int(overlay.sum()), int(image.sum()))
 
 
 class GCodeFormattingTests(unittest.TestCase):
@@ -895,6 +908,27 @@ class ScannerTests(unittest.TestCase):
         )
 
         self.assertEqual([(word.word, word.direction) for word in scan.words], [("CAT", "horizontal_left_to_right")])
+        self.assertIsNotNone(scan.grid)
+        assert scan.grid is not None
+        self.assertEqual(scan.grid.board_letters()[0][:3], ["C", "A", "T"])
+
+    def test_scan_camera_words_uses_calibrated_corners_for_grid(self) -> None:
+        import numpy as np
+
+        image = np.full((320, 320, 3), 255, dtype=np.uint8)
+        board_corners = [(30.0, 30.0), (270.0, 30.0), (270.0, 270.0), (30.0, 270.0)]
+        word_points = project_board_points(
+            board_corners,
+            [(0.1, 0.2), (2.9, 0.2), (2.9, 0.8), (0.1, 0.8)],
+        )
+
+        scan = scan_camera_words(
+            image,
+            confidence_threshold=50.0,
+            board_corners=board_corners,
+            ocr_reader=lambda frame: [[[[x, y] for x, y in word_points], "CAT", 0.91]],
+        )
+
         self.assertIsNotNone(scan.grid)
         assert scan.grid is not None
         self.assertEqual(scan.grid.board_letters()[0][:3], ["C", "A", "T"])

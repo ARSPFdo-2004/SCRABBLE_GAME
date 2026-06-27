@@ -61,6 +61,8 @@ class PlotterCalibration:
     y_steps_per_mm: float = 80.0
     cart_x_mm: float = 0.0
     cart_y_mm: float = 0.0
+    tile_cart_pitch_x_mm: float = 16.0
+    tile_cart_pitch_y_mm: float = 16.0
     tile_rack_x_mm: float = 335.0
     tile_rack_y_mm: float = 30.0
     tile_rack_pitch_mm: float = 10.0
@@ -146,6 +148,16 @@ class PlotterCalibration:
     def cart_position_in_machine(self) -> tuple[float, float]:
         return (self.cart_x_mm, self.cart_y_mm)
 
+    def tile_cart_position(self, index: int) -> tuple[float, float]:
+        if index < 1 or index > 16:
+            raise ValueError(f"Tile cart index must be between 1 and 16, got {index}")
+        row = (index - 1) // 4
+        col = (index - 1) % 4
+        return (
+            self.cart_x_mm + col * self.tile_cart_pitch_x_mm,
+            self.cart_y_mm + row * self.tile_cart_pitch_y_mm,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "board_size": self.board_size,
@@ -162,6 +174,8 @@ class PlotterCalibration:
             "y_steps_per_mm": self.y_steps_per_mm,
             "cart_x_mm": self.cart_x_mm,
             "cart_y_mm": self.cart_y_mm,
+            "tile_cart_pitch_x_mm": self.tile_cart_pitch_x_mm,
+            "tile_cart_pitch_y_mm": self.tile_cart_pitch_y_mm,
             "tile_rack_x_mm": self.tile_rack_x_mm,
             "tile_rack_y_mm": self.tile_rack_y_mm,
             "tile_rack_pitch_mm": self.tile_rack_pitch_mm,
@@ -198,6 +212,8 @@ class PlotterCalibration:
             y_steps_per_mm=float(payload.get("y_steps_per_mm", 80.0)),
             cart_x_mm=float(payload.get("cart_x_mm", 0.0)),
             cart_y_mm=float(payload.get("cart_y_mm", 0.0)),
+            tile_cart_pitch_x_mm=float(payload.get("tile_cart_pitch_x_mm", 16.0)),
+            tile_cart_pitch_y_mm=float(payload.get("tile_cart_pitch_y_mm", 16.0)),
             tile_rack_x_mm=float(payload.get("tile_rack_x_mm", 335.0)),
             tile_rack_y_mm=float(payload.get("tile_rack_y_mm", 30.0)),
             tile_rack_pitch_mm=float(payload.get("tile_rack_pitch_mm", 10.0)),

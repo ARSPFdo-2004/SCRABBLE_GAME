@@ -93,6 +93,8 @@ class ScrabblePlotterApp:
         self.y_steps_per_mm_var = tk.StringVar(value=str(self._calibration.y_steps_per_mm))
         self.cart_x_var = tk.StringVar(value=str(self._calibration.cart_x_mm))
         self.cart_y_var = tk.StringVar(value=str(self._calibration.cart_y_mm))
+        self.tile_cart_pitch_x_var = tk.StringVar(value=str(self._calibration.tile_cart_pitch_x_mm))
+        self.tile_cart_pitch_y_var = tk.StringVar(value=str(self._calibration.tile_cart_pitch_y_mm))
         self.tile_rack_tr1_x_var = tk.StringVar(value=str(self._calibration.tile_rack_x_mm))
         self.tile_rack_tr1_y_var = tk.StringVar(value=str(self._calibration.tile_rack_y_mm))
         self.tile_rack_tile_size_var = tk.StringVar(value=str(self._calibration.tile_rack_pitch_mm))
@@ -339,6 +341,8 @@ class ScrabblePlotterApp:
             ("Y Steps/mm", self.y_steps_per_mm_var),
             ("Cart X mm", self.cart_x_var),
             ("Cart Y mm", self.cart_y_var),
+            ("Tile Cart Pitch X", self.tile_cart_pitch_x_var),
+            ("Tile Cart Pitch Y", self.tile_cart_pitch_y_var),
             ("Tile Rack X mm", self.tile_rack_tr1_x_var),
             ("Tile Rack Y mm", self.tile_rack_tr1_y_var),
             ("Tile Rack Pitch mm", self.tile_rack_tile_size_var),
@@ -663,6 +667,8 @@ class ScrabblePlotterApp:
         self.y_steps_per_mm_var.set(str(self._calibration.y_steps_per_mm))
         self.cart_x_var.set(str(self._calibration.cart_x_mm))
         self.cart_y_var.set(str(self._calibration.cart_y_mm))
+        self.tile_cart_pitch_x_var.set(str(self._calibration.tile_cart_pitch_x_mm))
+        self.tile_cart_pitch_y_var.set(str(self._calibration.tile_cart_pitch_y_mm))
         self.tile_rack_tr1_x_var.set(str(self._calibration.tile_rack_x_mm))
         self.tile_rack_tr1_y_var.set(str(self._calibration.tile_rack_y_mm))
         self.tile_rack_tile_size_var.set(str(self._calibration.tile_rack_pitch_mm))
@@ -980,12 +986,23 @@ class ScrabblePlotterApp:
 
     def preview_move(self) -> None:
         try:
+            target = self.square_var.get().strip().upper()
+            if self._is_tile_rack_target(target):
+                command, x, y = self._tile_rack_target_move_command(target)
+                self._set_status(f"Preview {target} -> X={x:.3f}, Y={y:.3f}")
+                self._log(command)
+                return
+            if self._is_tile_cart_target(target):
+                command, x, y = self._tile_cart_target_move_command(target)
+                self._set_status(f"Preview {target} -> X={x:.3f}, Y={y:.3f}")
+                self._log(command)
+                return
             calibration = self._calibration_from_form()
             calibration.validate_ready_for_move()
-            square = parse_square_label(self.square_var.get())
+            square = parse_square_label(target)
             x, y = calibration.square_center_in_machine(square)
             gcode = format_move_command(x, y, self._optional_float(self.feed_rate_var.get()), self.command_var.get())
-            self._set_status(f"{square.label} -> X={x:.3f}, Y={y:.3f}")
+            self._set_status(f"Preview {square.label} -> X={x:.3f}, Y={y:.3f}")
             self._log(gcode)
         except Exception as exc:
             self._show_error(exc)
@@ -1005,6 +1022,19 @@ class ScrabblePlotterApp:
                     self._log(command)
 
                 self._run_background_task(f"Moving to {target}...", work, done)
+                return
+            if self._is_tile_cart_target(target):
+                command, x, y = self._tile_cart_target_move_command(target)
+                config = self._serial_config()
+
+                def work_tc():  # type: ignore[no-untyped-def]
+                    return self._send_tile_rack_move_command(command, config=config)
+
+                def done_tc(_responses) -> None:  # type: ignore[no-untyped-def]
+                    self._set_status(f"Moved to {target} at X{x:g} Y{y:g}.")
+                    self._log(command)
+
+                self._run_background_task(f"Moving to {target}...", work_tc, done_tc)
                 return
             calibration = self._calibration_from_form()
             calibration.validate_ready_for_move()
@@ -1061,6 +1091,29 @@ class ScrabblePlotterApp:
         self._ensure_tile_rack_move_state()
         slot_index = int(target[2:]) - 1
         x, y = self._tile_rack_slot_position(slot_index)
+        feed = float(self.tile_rack_feed_var.get())
+        command = f"G0 X{x:g} Y{y:g} F{feed:g}"
+        return command, x, y
+
+    def _is_tile_cart_target(self, target: str) -> bool:
+        return (
+            len(target) >= 3
+            and target[:2] == "TC"
+            and target[2:].isdigit()
+            and 1 <= int(target[2:]) <= 16
+        )
+
+    def _send_tile_cart_target_move(self, target: str) -> None:
+        command, x, y = self._tile_cart_target_move_command(target)
+        self._send_tile_rack_move_command(command)
+        self._set_status(f"Moved to {target} at X{x:g} Y{y:g}.")
+        self._log(command)
+
+    def _tile_cart_target_move_command(self, target: str) -> tuple[str, float, float]:
+        self._ensure_tile_rack_move_state()
+        index = int(target[2:])
+        calibration = self._calibration_from_form()
+        x, y = calibration.tile_cart_position(index)
         feed = float(self.tile_rack_feed_var.get())
         command = f"G0 X{x:g} Y{y:g} F{feed:g}"
         return command, x, y
@@ -2887,10 +2940,17 @@ class ScrabblePlotterApp:
             self._show_error(exc)
 
     def _validate_pick_drop_targets(self, pickup_target: str, drop_target: str) -> None:
-        if not (self._is_tile_rack_target(pickup_target) or self._looks_like_board_square(pickup_target)):
-            raise ValueError("Enter pickup as a board square like A1 or rack slot TR1 to TR7.")
-        if not self._looks_like_board_square(drop_target):
-            raise ValueError("Enter drop as a board square like H8.")
+        def is_valid_target(target: str) -> bool:
+            return (
+                self._is_tile_rack_target(target) or
+                self._is_tile_cart_target(target) or
+                self._looks_like_board_square(target)
+            )
+
+        if not is_valid_target(pickup_target):
+            raise ValueError("Enter pickup as a board square (e.g. A1), rack slot (TR1-TR7), or cart slot (TC1-TC16).")
+        if not is_valid_target(drop_target):
+            raise ValueError("Enter drop as a board square (e.g. H8), rack slot (TR1-TR7), or cart slot (TC1-TC16).")
 
     def _pick_drop_z_height_command(self) -> str:
         angle = int(float(self.z_height_angle.get()))
@@ -2928,6 +2988,9 @@ class ScrabblePlotterApp:
         target = target.strip().upper()
         if self._is_tile_rack_target(target):
             self._send_tile_rack_target_move(target)
+            return
+        if self._is_tile_cart_target(target):
+            self._send_tile_cart_target_move(target)
             return
         self._send_pick_drop_ordered_board_move(target)
 
@@ -3934,9 +3997,16 @@ class ScrabblePlotterApp:
         confidence_threshold: float,
         announce: bool,
         scan_token: int,
+        calibration: PlotterCalibration | None = None,
     ) -> None:  # type: ignore[no-untyped-def]
         try:
-            scan = scan_camera_letters(frame, confidence_threshold=confidence_threshold)
+            calibration = calibration or getattr(self, "_calibration", None)
+            board_corners = getattr(calibration, "image_corners", None)
+            scan = scan_camera_letters(
+                frame,
+                confidence_threshold=confidence_threshold,
+                board_corners=board_corners,
+            )
             self.root.after(
                 0,
                 lambda: self._handle_camera_letter_scan_result(scan, announce=announce, scan_token=scan_token),
@@ -3961,7 +4031,12 @@ class ScrabblePlotterApp:
     ) -> None:  # type: ignore[no-untyped-def]
         try:
             board_frame = self._frame_limited_to_calibrated_board(frame, calibration=calibration)
-            scan = scan_camera_words(board_frame, confidence_threshold=confidence_threshold)
+            board_corners = getattr(calibration, "image_corners", None)
+            scan = scan_camera_words(
+                board_frame,
+                confidence_threshold=confidence_threshold,
+                board_corners=board_corners,
+            )
             self.root.after(
                 0,
                 lambda: self._handle_camera_word_scan_result(scan, announce=announce, scan_token=scan_token),
@@ -4533,6 +4608,8 @@ class ScrabblePlotterApp:
         calibration.y_steps_per_mm = float(self.y_steps_per_mm_var.get())
         calibration.cart_x_mm = float(self.cart_x_var.get())
         calibration.cart_y_mm = float(self.cart_y_var.get())
+        calibration.tile_cart_pitch_x_mm = float(self.tile_cart_pitch_x_var.get())
+        calibration.tile_cart_pitch_y_mm = float(self.tile_cart_pitch_y_var.get())
         calibration.tile_rack_x_mm = float(self.tile_rack_tr1_x_var.get())
         calibration.tile_rack_y_mm = float(self.tile_rack_tr1_y_var.get())
         calibration.tile_rack_pitch_mm = float(self.tile_rack_tile_size_var.get())
@@ -5431,7 +5508,7 @@ class ScrabblePlotterApp:
     def _start_turn(self) -> None:
         self._current_player_display_var.set(f"Current Player: {self._current_player}")
         self._turn_start_board_state = dict(self._previous_board_state)
-        self._move_tile_cart_for_current_player()
+        self._start_cart_movement_countdown()
         import time
         self._turn_end_time = time.time() + 120.0
         if not self._timer_running:
@@ -5480,6 +5557,38 @@ class ScrabblePlotterApp:
 
     def move_tile_cart_to_current_player(self) -> None:
         self._move_tile_cart_for_current_player(force=True)
+
+    def _start_cart_movement_countdown(self) -> None:
+        if not self._tile_cart_enabled():
+            return
+        player_id = self._current_player_id()
+        if self._tile_cart_player_position == player_id:
+            return
+
+        if getattr(self, "_cart_countdown_after_id", None):
+            try:
+                self.root.after_cancel(self._cart_countdown_after_id)
+            except Exception:
+                pass
+
+        import time
+        self._cart_countdown_end_time = time.time() + 45.0
+        self._cart_countdown_running = True
+        self._update_cart_countdown()
+
+    def _update_cart_countdown(self) -> None:
+        if not getattr(self, "_cart_countdown_running", False):
+            return
+        import time
+        remaining = max(0, int(self._cart_countdown_end_time - time.time()))
+        if remaining > 0:
+            self._current_player_display_var.set(f"Current Player: {self._current_player} (Cart moves in {remaining}s)")
+            self._cart_countdown_after_id = self.root.after(200, self._update_cart_countdown)
+        else:
+            self._current_player_display_var.set(f"Current Player: {self._current_player}")
+            self._cart_countdown_running = False
+            self._cart_countdown_after_id = None
+            self._move_tile_cart_for_current_player()
 
     def _move_tile_cart_for_current_player(self, force: bool = False) -> None:
         if not self._tile_cart_enabled():
@@ -5743,6 +5852,42 @@ class ScrabblePlotterApp:
         self._pending_turn_scan = False
         self._update_grid_colors()
         self._pending_ai_move_candidate = None
+
+        board_count = sum(1 for v in self._previous_board_state.values() if v)
+        k = len(candidate.placements)
+        empty_slots = [p.rack_slot for p in candidate.placements]
+
+        refill_steps = []
+        if empty_slots:
+            refill_steps.append(("Set Z height", lambda: self._send_pick_drop_ordered_command(self._pick_drop_z_height_command())))
+            for i, slot in enumerate(empty_slots):
+                tc_index = board_count - k + 1 + i
+                pickup = f"tc{tc_index}"
+                drop = f"tr{slot}"
+                refill_steps.extend([
+                    ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
+                    (f"Move to pickup {pickup}", lambda p=pickup: self._send_pick_drop_ordered_target_move(p)),
+                    ("Z down", lambda: self._send_pick_drop_ordered_command(Z_DOWN_COMMAND)),
+                    ("Magnet on", lambda: self._send_pick_drop_ordered_command("M1")),
+                    ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
+                    (f"Move to drop {drop}", lambda d=drop: self._send_pick_drop_ordered_target_move(d)),
+                    ("Z down", lambda: self._send_pick_drop_ordered_command(Z_DOWN_COMMAND)),
+                    ("Magnet off", lambda: self._send_pick_drop_ordered_command("M0")),
+                    ("Z up", lambda: self._send_pick_drop_ordered_command(Z_UP_COMMAND)),
+                ])
+            refill_steps.append(("Reset to start", lambda: self._send_pick_drop_ordered_reset()))
+
+        if refill_steps:
+            self._set_status(f"Player 1 AI placed {candidate.word}. Refilling rack...")
+            self._run_pick_drop_steps(
+                refill_steps,
+                None,
+                on_complete=lambda: self._complete_ai_turn_switch(candidate)
+            )
+        else:
+            self._complete_ai_turn_switch(candidate)
+
+    def _complete_ai_turn_switch(self, candidate: AiMoveCandidate) -> None:
         self._ai_player_running = False
         self._pick_drop_running = False
         self._set_status(f"Player 1 AI placed {candidate.word}. Switching to Player 2.")

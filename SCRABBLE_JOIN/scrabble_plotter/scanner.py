@@ -22,6 +22,7 @@ EasyOcrReader = Callable[[Any], Any]
 PaddleOcrReader = EasyOcrReader
 _EASY_OCR_READER = None
 _EASY_OCR_LOCK = threading.Lock()
+_OCR_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789|![]"
 
 
 @dataclass(frozen=True)
@@ -299,6 +300,12 @@ class CameraFrameQuality:
     brightness: float
 
 
+@dataclass(frozen=True)
+class OcrImageVariant:
+    image: Any
+    scale: float = 1.0
+
+
 def scan_image_file(
     image_path: str | Path,
     calibration: PlotterCalibration,
@@ -389,13 +396,14 @@ def scan_camera_letters(
     frame,
     confidence_threshold: float = 50.0,
     ocr_reader: EasyOcrReader | None = None,
+    board_corners: list[tuple[float, float]] | list[list[float]] | None = None,
 ) -> CameraLetterScanResult:  # type: ignore[no-untyped-def]
     if ocr_reader is None:
         tiles = detect_camera_tiles(frame, confidence_threshold=min(confidence_threshold, 15.0))
         if tiles:
             return CameraLetterScanResult(
                 letters=captured_letters_from_camera_tiles(tiles),
-                grid=build_camera_ocr_grid(frame, tiles=tiles),
+                grid=build_camera_ocr_grid(frame, tiles=tiles, corners=board_corners),
             )
 
     raw_result = ocr_reader(frame) if ocr_reader is not None else read_frame_with_easyocr(frame)
@@ -403,7 +411,7 @@ def scan_camera_letters(
     boxes = camera_character_text_boxes(frame, boxes)
     return CameraLetterScanResult(
         letters=captured_letters_from_text_boxes(boxes),
-        grid=build_camera_ocr_grid(frame, text_boxes=boxes),
+        grid=build_camera_ocr_grid(frame, text_boxes=boxes, corners=board_corners),
     )
 
 
@@ -411,6 +419,7 @@ def scan_camera_words(
     frame,
     confidence_threshold: float = 50.0,
     ocr_reader: EasyOcrReader | None = None,
+    board_corners: list[tuple[float, float]] | list[list[float]] | None = None,
 ) -> CameraWordScanResult:  # type: ignore[no-untyped-def]
     detected_tiles = (
         detect_camera_tiles(frame, confidence_threshold=min(confidence_threshold, 15.0))
@@ -425,7 +434,7 @@ def scan_camera_words(
         identify_directional_tile_words(detected_tiles) + identify_directional_words(boxes)
     ))
     detected_words = _remove_contained_partial_words(detected_words)
-    grid = build_camera_ocr_grid(frame, tiles=detected_tiles, text_boxes=boxes)
+    grid = build_camera_ocr_grid(frame, tiles=detected_tiles, text_boxes=boxes, corners=board_corners)
     return CameraWordScanResult(
         words=detected_words,
         tiles=detected_tiles or text_box_tiles,
@@ -576,17 +585,18 @@ def build_camera_ocr_grid(
     tiles: list[CameraTile] | None = None,
     text_boxes: list[EasyOcrTextBox] | None = None,
     board_size: int = BOARD_SIZE,
+    corners: list[tuple[float, float]] | list[list[float]] | None = None,
 ) -> CameraOcrGrid | None:  # type: ignore[no-untyped-def]
-    corners = detect_board_grid_corners(frame)
-    if corners is None:
+    detected_corners = _normalize_corner_points(corners) if corners is not None else detect_board_grid_corners(frame)
+    if detected_corners is None:
         return None
     cells = camera_grid_cells_from_ocr(
-        corners,
+        detected_corners,
         tiles=tiles or [],
         text_boxes=text_boxes or [],
         board_size=board_size,
     )
-    return CameraOcrGrid(corners=corners, cells=cells, board_size=board_size)
+    return CameraOcrGrid(corners=detected_corners, cells=cells, board_size=board_size)
 
 
 def camera_grid_cells_from_ocr(
@@ -659,6 +669,26 @@ def board_square_from_image_point(
     return square_label(row, col)
 
 
+def _normalize_corner_points(
+    corners: list[tuple[float, float]] | list[list[float]] | None,
+) -> list[tuple[float, float]] | None:
+    if corners is None or len(corners) != 4:
+        return None
+
+    normalized: list[tuple[float, float]] = []
+    for point in corners:
+        try:
+            if len(point) < 2:
+                return None
+        except TypeError:
+            return None
+        try:
+            normalized.append((float(point[0]), float(point[1])))
+        except (TypeError, ValueError):
+            return None
+    return normalized
+
+
 def detect_board_grid_corners(frame) -> list[tuple[float, float]] | None:  # type: ignore[no-untyped-def]
     corners = _detect_board_corners_from_dark_grid(frame)
     if corners is not None:
@@ -687,9 +717,25 @@ def read_tile_letter_with_easyocr(
     ocr_reader: EasyOcrReader | None = None,
 ) -> tuple[str, float]:  # type: ignore[no-untyped-def]
     inner = _tile_inner_crop(tile_image)
-    raw_result = ocr_reader(inner) if ocr_reader is not None else read_frame_with_easyocr(inner)
-    boxes = parse_easyocr_text_boxes(raw_result, confidence_threshold=0.0)
+    if ocr_reader is not None:
+        raw_result = ocr_reader(inner)
+        boxes = parse_easyocr_text_boxes(raw_result, confidence_threshold=0.0)
+    else:
+        boxes = _read_easyocr_boxes_from_variants(inner, limit=3)
     boxes = camera_character_text_boxes(inner, boxes)
+    best_letter, best_confidence = _best_letter_from_text_boxes(boxes)
+    if best_letter and best_confidence >= 45.0:
+        return best_letter, best_confidence
+
+    tesseract_letter, tesseract_confidence = _read_tile_letter_with_tesseract(inner)
+    if not best_letter:
+        return tesseract_letter, tesseract_confidence
+    if tesseract_letter == best_letter:
+        return best_letter, max(best_confidence, tesseract_confidence)
+    return best_letter, best_confidence
+
+
+def _best_letter_from_text_boxes(boxes: list[EasyOcrTextBox]) -> tuple[str, float]:
     best_letter = ""
     best_confidence = 0.0
     best_score = 0.0
@@ -697,12 +743,24 @@ def read_tile_letter_with_easyocr(
         letter = normalize_letter(box.text[:1])
         if not letter:
             continue
-        score = box.confidence * box.width * box.height
+        area_weight = max(1.0, min(3.0, (box.width * box.height) / 900.0))
+        score = box.confidence * area_weight
         if score > best_score:
             best_letter = letter
             best_confidence = box.confidence
             best_score = score
     return best_letter, best_confidence
+
+
+def _read_tile_letter_with_tesseract(tile_image) -> tuple[str, float]:  # type: ignore[no-untyped-def]
+    try:
+        pytesseract = _require_pytesseract()
+        processed = preprocess_cell_for_ocr(tile_image)
+        config = "--psm 10 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        data = pytesseract.image_to_data(processed, config=config, output_type=pytesseract.Output.DICT)
+        return parse_tesseract_data(data)
+    except Exception:
+        return "", 0.0
 
 
 def read_tile_letter_with_paddleocr(
@@ -713,24 +771,102 @@ def read_tile_letter_with_paddleocr(
 
 
 def read_frame_with_easyocr(frame):  # type: ignore[no-untyped-def]
-    reader = _easy_ocr_reader()
-    with _EASY_OCR_LOCK:
-        try:
-            return reader.readtext(
-                frame,
-                allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789|!",
-                batch_size=4,
-                paragraph=False,
-                text_threshold=0.45,
-                low_text=0.25,
-                link_threshold=0.25,
-            )
-        except TypeError:
-            return reader.readtext(frame)
+    boxes = _read_easyocr_boxes_from_variants(frame)
+    return [
+        [
+            [[point[0], point[1]] for point in box.points],
+            box.text,
+            box.confidence,
+        ]
+        for box in boxes
+    ]
 
 
 def read_frame_with_paddleocr(frame):  # type: ignore[no-untyped-def]
     return read_frame_with_easyocr(frame)
+
+
+def _read_easyocr_boxes_from_variants(frame, limit: int | None = None) -> list[EasyOcrTextBox]:  # type: ignore[no-untyped-def]
+    reader = _easy_ocr_reader()
+    boxes: list[EasyOcrTextBox] = []
+    variants = _ocr_image_variants(frame)
+    if limit is not None:
+        variants = variants[:limit]
+    for variant in variants:
+        raw_result = _read_easyocr_raw(reader, variant.image)
+        for box in parse_easyocr_text_boxes(raw_result, confidence_threshold=0.0):
+            boxes.append(_scale_text_box(box, 1.0 / variant.scale))
+    return _dedupe_text_boxes(boxes)
+
+
+def _read_easyocr_raw(reader: Any, image: Any) -> Any:
+    with _EASY_OCR_LOCK:
+        try:
+            return reader.readtext(
+                image,
+                allowlist=_OCR_ALLOWLIST,
+                batch_size=4,
+                paragraph=False,
+                text_threshold=0.32,
+                low_text=0.16,
+                link_threshold=0.18,
+                contrast_ths=0.05,
+                adjust_contrast=0.7,
+                canvas_size=2560,
+                mag_ratio=1.4,
+            )
+        except TypeError:
+            return reader.readtext(image)
+
+
+def _ocr_image_variants(frame) -> list[OcrImageVariant]:  # type: ignore[no-untyped-def]
+    cv2 = _require_cv2()
+    if frame is None:
+        return []
+
+    height, width = frame.shape[:2]
+    if width <= 0 or height <= 0:
+        return []
+
+    scale = max(1.0, min(2.4, 960.0 / float(width)))
+    if scale > 1.01:
+        base = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    else:
+        base = frame
+        scale = 1.0
+
+    gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY) if len(base.shape) == 3 else base
+    variants = [OcrImageVariant(base, scale)]
+
+    clahe = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8)).apply(gray)
+    variants.append(OcrImageVariant(clahe, scale))
+
+    blurred = cv2.GaussianBlur(clahe, (0, 0), 1.0)
+    sharpened = cv2.addWeighted(clahe, 1.7, blurred, -0.7, 0)
+    variants.append(OcrImageVariant(sharpened, scale))
+
+    threshold = cv2.adaptiveThreshold(
+        sharpened,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        7,
+    )
+    variants.append(OcrImageVariant(threshold, scale))
+    variants.append(OcrImageVariant(cv2.bitwise_not(threshold), scale))
+
+    return variants
+
+
+def _scale_text_box(box: EasyOcrTextBox, scale: float) -> EasyOcrTextBox:
+    if abs(scale - 1.0) < 0.0001:
+        return box
+    return EasyOcrTextBox(
+        text=box.text,
+        confidence=box.confidence,
+        points=[(point[0] * scale, point[1] * scale) for point in box.points],
+    )
 
 
 def parse_easyocr_text_boxes(
@@ -741,7 +877,7 @@ def parse_easyocr_text_boxes(
     for text_box in _iter_easyocr_text_boxes(raw_result):
         if text_box.confidence >= confidence_threshold and text_box.text:
             boxes.append(text_box)
-    return boxes
+    return _dedupe_text_boxes(boxes)
 
 
 def parse_paddleocr_text_boxes(
@@ -752,7 +888,7 @@ def parse_paddleocr_text_boxes(
     for text_box in _iter_paddleocr_text_boxes(raw_result):
         if text_box.confidence >= confidence_threshold and text_box.text:
             boxes.append(text_box)
-    return boxes
+    return _dedupe_text_boxes(boxes)
 
 
 def identify_directional_words(
@@ -1489,6 +1625,33 @@ def _dedupe_camera_words(words: list[CameraWord]) -> list[CameraWord]:
         seen.add(key)
         deduped.append(word)
     return deduped
+
+
+def _dedupe_text_boxes(boxes: list[EasyOcrTextBox]) -> list[EasyOcrTextBox]:
+    selected: list[EasyOcrTextBox] = []
+    for box in sorted(boxes, key=lambda item: (-item.confidence, item.top, item.left)):
+        duplicate = False
+        for existing in selected:
+            if box.text == existing.text and _text_box_overlap_ratio(box, existing) >= 0.45:
+                duplicate = True
+                break
+        if not duplicate:
+            selected.append(box)
+    return sorted(selected, key=lambda item: (item.top, item.left))
+
+
+def _text_box_overlap_ratio(first: EasyOcrTextBox, second: EasyOcrTextBox) -> float:
+    left = max(first.left, second.left)
+    top = max(first.top, second.top)
+    right = min(first.right, second.right)
+    bottom = min(first.bottom, second.bottom)
+    if right <= left or bottom <= top:
+        return 0.0
+    overlap = (right - left) * (bottom - top)
+    smaller_area = min(first.width * first.height, second.width * second.height)
+    if smaller_area <= 0:
+        return 0.0
+    return overlap / smaller_area
 
 
 def _direction_sort_rank(direction: str) -> int:

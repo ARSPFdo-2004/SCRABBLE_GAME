@@ -253,6 +253,7 @@ class OpenAIPlotterAgent:
             f"offset Y {calibration.offset_y_mm:.3f} mm, "
             f"cell size {calibration.cell_size_mm:.3f} mm, "
             f"cart X {calibration.cart_x_mm:.3f} mm, cart Y {calibration.cart_y_mm:.3f} mm.\n"
+            "Valid pickup targets include tile rack slots (TR1-TR7) and tile cart grid slots (TC1-TC16).\n"
             f"User objective: {objective.strip() or 'Choose the safest next action.'}"
         )
 
@@ -285,6 +286,7 @@ class OpenAIPlotterAgent:
             "You are Player 1 in a physical Scrabble-style game. "
             "Choose exactly one legal move from the candidate list. "
             "The app has already validated board bounds, rack slots, anchors, cross-words, and plotter safety. "
+            "Valid pickup targets include tile rack slots (TR1-TR7) and tile cart grid slots (TC1-TC16). "
             "Do not invent new words, squares, rack slots, G-code, motor steps, or coordinates.\n"
             "Return exactly one JSON object and no extra text.\n"
             'To play a move: {"action":"play","candidate_id":"C001","reason":"short reason"}\n'
