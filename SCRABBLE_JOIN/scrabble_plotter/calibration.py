@@ -52,7 +52,6 @@ class PlotterCalibration:
     image_path: str | None = None
     image_corners: list[list[float]] = field(default_factory=list)
     camera_index: int = 0
-    tile_rack_camera_index: int = 1
     offset_x_mm: float = 0.0
     offset_y_mm: float = 0.0
     cell_size_mm: float = CELL_SIZE_MM
@@ -76,7 +75,8 @@ class PlotterCalibration:
     tile_cart_url: str = "http://192.168.4.1"
     tile_cart_player_1_command: str = "backward"
     tile_cart_player_2_command: str = "forward"
-    tile_cart_distance_cm: float = 30.0
+    tile_cart_speed_pwm: int = 200
+    tile_cart_distance_cm: float = 5.0
 
     def set_image_corners(
         self,
@@ -166,7 +166,6 @@ class PlotterCalibration:
             "image_path": self.image_path,
             "image_corners": self.image_corners,
             "camera_index": self.camera_index,
-            "tile_rack_camera_index": self.tile_rack_camera_index,
             "offset_x_mm": self.offset_x_mm,
             "offset_y_mm": self.offset_y_mm,
             "cell_size_mm": self.cell_size_mm,
@@ -189,6 +188,7 @@ class PlotterCalibration:
             "tile_cart_url": self.tile_cart_url,
             "tile_cart_player_1_command": self.tile_cart_player_1_command,
             "tile_cart_player_2_command": self.tile_cart_player_2_command,
+            "tile_cart_speed_pwm": self.tile_cart_speed_pwm,
             "tile_cart_distance_cm": self.tile_cart_distance_cm,
         }
 
@@ -204,7 +204,6 @@ class PlotterCalibration:
             image_path=payload.get("image_path"),
             image_corners=payload.get("image_corners", []),
             camera_index=int(payload.get("camera_index", 0)),
-            tile_rack_camera_index=int(payload.get("tile_rack_camera_index", 1)),
             offset_x_mm=float(payload.get("offset_x_mm", 0.0)),
             offset_y_mm=float(payload.get("offset_y_mm", 0.0)),
             cell_size_mm=float(payload.get("cell_size_mm", CELL_SIZE_MM)),
@@ -234,7 +233,8 @@ class PlotterCalibration:
             tile_cart_url=str(payload.get("tile_cart_url") or "http://192.168.4.1"),
             tile_cart_player_1_command=str(payload.get("tile_cart_player_1_command") or "backward"),
             tile_cart_player_2_command=str(payload.get("tile_cart_player_2_command") or "forward"),
-            tile_cart_distance_cm=float(payload.get("tile_cart_distance_cm", 30.0)),
+            tile_cart_speed_pwm=int(payload.get("tile_cart_speed_pwm", 200)),
+            tile_cart_distance_cm=float(payload.get("tile_cart_distance_cm", 5.0)),
         )
 
     @classmethod
@@ -259,7 +259,25 @@ def board_corner_points(board_size: int = BOARD_SIZE) -> list[list[float]]:
 
 
 def default_premium_layout(board_size: int = BOARD_SIZE) -> list[list[str]]:
-    return [[PREMIUM_NORMAL for _ in range(board_size)] for _ in range(board_size)]
+    layout = [[PREMIUM_NORMAL for _ in range(board_size)] for _ in range(board_size)]
+    if board_size == 12:
+        # TW (Triple Word)
+        for r, c in [(0, 0), (0, 11), (11, 0), (11, 11), (0, 5), (0, 6), (5, 0), (6, 0), (11, 5), (11, 6), (5, 11), (6, 11)]:
+            layout[r][c] = PREMIUM_TRIPLE_WORD
+        
+        # DW (Double Word)
+        for r, c in [(1, 1), (2, 2), (3, 3), (4, 4), (1, 10), (2, 9), (3, 8), (4, 7), (10, 1), (9, 2), (8, 3), (7, 4), (10, 10), (9, 9), (8, 8), (7, 7)]:
+            layout[r][c] = PREMIUM_DOUBLE_WORD
+
+        # TL (Triple Letter)
+        for r, c in [(1, 5), (1, 6), (5, 1), (6, 1), (10, 5), (10, 6), (5, 10), (6, 10), (5, 5), (6, 6), (5, 6), (6, 5)]:
+            layout[r][c] = PREMIUM_TRIPLE_LETTER
+
+        # DL (Double Letter)
+        for r, c in [(0, 3), (0, 8), (3, 0), (8, 0), (11, 3), (11, 8), (3, 11), (8, 11), (2, 6), (2, 5), (3, 3), (3, 8), (8, 3), (8, 8), (6, 2), (5, 2), (6, 9), (5, 9)]:
+            layout[r][c] = PREMIUM_DOUBLE_LETTER
+
+    return layout
 
 
 def normalize_premium_layout(payload: Any, board_size: int = BOARD_SIZE) -> list[list[str]]:

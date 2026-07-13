@@ -76,6 +76,7 @@ def draw_board_overlay(
         board_size=calibration.board_size,
         board_letters=board_letters,
         show_empty_labels=True,
+        premium_layout=calibration.premium_layout,
     )
 
 
@@ -84,13 +85,11 @@ def draw_camera_ocr_grid_overlay(frame, ocr_grid):  # type: ignore[no-untyped-de
         return frame
 
     board_letters = ocr_grid.board_letters() if hasattr(ocr_grid, "board_letters") else None
-    board_confidences = _grid_confidences(ocr_grid)
     return draw_grid_overlay(
         frame,
         ocr_grid.corners,
         board_size=getattr(ocr_grid, "board_size", BOARD_SIZE),
         board_letters=board_letters,
-        board_confidences=board_confidences,
         show_empty_labels=False,
     )
 
@@ -100,11 +99,21 @@ def draw_grid_overlay(
     corners: list[list[float]] | list[tuple[float, float]],
     board_size: int = BOARD_SIZE,
     board_letters: list[list[str]] | None = None,
-    board_confidences: list[list[float]] | None = None,
     show_empty_labels: bool = True,
+    premium_layout: list[list[str]] | None = None,
 ):  # type: ignore[no-untyped-def]
     cv2 = _require_cv2()
     overlay = frame.copy()
+
+    from .calibration import PREMIUM_NORMAL
+    from .scoring import PREMIUM_SHORT_LABELS
+
+    PREMIUM_COLORS = {
+        "double_letter": (255, 200, 100),  # Light Blue
+        "triple_letter": (255, 50, 50),    # Dark Blue
+        "double_word": (100, 100, 255),    # Pink
+        "triple_word": (0, 0, 255),        # Red
+    }
 
     for start, end in grid_segments(corners, board_size):
         cv2.line(overlay, _int_point(start), _int_point(end), (0, 255, 255), 1, cv2.LINE_AA)
@@ -124,27 +133,33 @@ def draw_grid_overlay(
         col = index % board_size
         letter = _letter_at(board_letters, row, col)
         if letter:
-            _draw_centered_letter_confidence(
-                overlay,
-                letter,
-                _confidence_at(board_confidences, row, col),
-                (x, y),
-                letter_scale=0.78,
-                confidence_scale=0.34,
-                text_color=(0, 0, 0),
-                fill_color=(70, 255, 130),
-            )
+            _draw_centered_text(overlay, letter, (x, y), 0.95, (0, 0, 0), (70, 255, 130), 2)
         elif show_empty_labels:
-            cv2.putText(
-                overlay,
-                label,
-                (x - 10, y + 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.35,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
+            premium = premium_layout[row][col] if premium_layout else PREMIUM_NORMAL
+            if premium != PREMIUM_NORMAL:
+                short_label = PREMIUM_SHORT_LABELS.get(premium, "")
+                color = PREMIUM_COLORS.get(premium, (255, 255, 255))
+                cv2.putText(
+                    overlay,
+                    short_label,
+                    (x - 12, y + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+            else:
+                cv2.putText(
+                    overlay,
+                    label,
+                    (x - 10, y + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
 
     return overlay
 
@@ -197,16 +212,7 @@ def draw_detected_tiles_overlay(frame, detected_tiles):  # type: ignore[no-untyp
                 int(round(sum(point[0] for point in points) / len(points))),
                 int(round(sum(point[1] for point in points) / len(points))),
             )
-            _draw_centered_letter_confidence(
-                overlay,
-                letter,
-                getattr(tile, "confidence", 0.0),
-                center,
-                letter_scale=0.62,
-                confidence_scale=0.34,
-                text_color=(0, 0, 0),
-                fill_color=(70, 255, 130),
-            )
+            _draw_centered_text(overlay, letter, center, 0.65, (0, 0, 0), (70, 255, 130), 2)
     return overlay
 
 
@@ -227,24 +233,6 @@ def draw_detected_words_overlay(frame, detected_words, show_labels: bool = True)
     return overlay
 
 
-def _grid_confidences(ocr_grid) -> list[list[float]] | None:  # type: ignore[no-untyped-def]
-    board_size = getattr(ocr_grid, "board_size", BOARD_SIZE)
-    cells = getattr(ocr_grid, "cells", None)
-    if cells is None:
-        return None
-
-    confidences = [[0.0 for _ in range(board_size)] for _ in range(board_size)]
-    for cell in cells:
-        row = int(getattr(cell, "row", -1))
-        col = int(getattr(cell, "col", -1))
-        if 0 <= row < board_size and 0 <= col < board_size:
-            try:
-                confidences[row][col] = max(confidences[row][col], float(getattr(cell, "confidence", 0.0)))
-            except (TypeError, ValueError):
-                pass
-    return confidences
-
-
 def _letter_at(board_letters: list[list[str]] | None, row: int, col: int) -> str:
     if board_letters is None or row >= len(board_letters) or col >= len(board_letters[row]):
         return ""
@@ -252,78 +240,6 @@ def _letter_at(board_letters: list[list[str]] | None, row: int, col: int) -> str
     if len(letter) == 1 and "A" <= letter <= "Z":
         return letter
     return ""
-
-
-def _confidence_at(board_confidences: list[list[float]] | None, row: int, col: int) -> float:
-    if board_confidences is None or row >= len(board_confidences) or col >= len(board_confidences[row]):
-        return 0.0
-    try:
-        return float(board_confidences[row][col])
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _confidence_label(confidence: float) -> str:
-    if confidence <= 0:
-        return ""
-    return f"{confidence:.0f}%"
-
-
-def _draw_centered_letter_confidence(
-    frame,
-    letter: str,
-    confidence: float,
-    center: tuple[int, int],
-    letter_scale: float,
-    confidence_scale: float,
-    text_color: tuple[int, int, int],
-    fill_color: tuple[int, int, int],
-) -> None:  # type: ignore[no-untyped-def]
-    cv2 = _require_cv2()
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    letter = str(letter).strip().upper()
-    confidence_text = _confidence_label(confidence)
-    letter_thickness = 2
-    confidence_thickness = 1
-    (letter_width, letter_height), letter_baseline = cv2.getTextSize(letter, font, letter_scale, letter_thickness)
-    if confidence_text:
-        (confidence_width, confidence_height), confidence_baseline = cv2.getTextSize(
-            confidence_text,
-            font,
-            confidence_scale,
-            confidence_thickness,
-        )
-        gap = 2
-    else:
-        confidence_width = confidence_height = confidence_baseline = gap = 0
-
-    text_width = max(letter_width, confidence_width)
-    total_height = letter_height + letter_baseline + gap + confidence_height + confidence_baseline
-    pad_x = 4
-    pad_y = 3
-    left = int(center[0] - text_width / 2) - pad_x
-    top = int(center[1] - total_height / 2) - pad_y
-    right = left + text_width + pad_x * 2
-    bottom = top + total_height + pad_y * 2
-    cv2.rectangle(frame, (left, top), (right, bottom), fill_color, -1)
-
-    letter_x = int(center[0] - letter_width / 2)
-    letter_y = top + pad_y + letter_height
-    cv2.putText(frame, letter, (letter_x, letter_y), font, letter_scale, text_color, letter_thickness, cv2.LINE_AA)
-
-    if confidence_text:
-        confidence_x = int(center[0] - confidence_width / 2)
-        confidence_y = letter_y + letter_baseline + gap + confidence_height
-        cv2.putText(
-            frame,
-            confidence_text,
-            (confidence_x, confidence_y),
-            font,
-            confidence_scale,
-            text_color,
-            confidence_thickness,
-            cv2.LINE_AA,
-        )
 
 
 def _draw_centered_text(

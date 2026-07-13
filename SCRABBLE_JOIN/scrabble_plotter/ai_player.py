@@ -231,6 +231,11 @@ def _candidate_at(
     for index, letter in enumerate(word):
         row = start_row + row_step * index
         col = start_col + col_step * index
+        
+        # The user requested to never play in A1 (0, 0), B1 (0, 1), or A2 (1, 0)
+        if (row, col) in ((0, 0), (0, 1), (1, 0)):
+            return None
+
         existing = board[row][col]
         if existing:
             if existing != letter:
@@ -249,8 +254,13 @@ def _candidate_at(
 
     if not placements:
         return None
-    if board_has_tiles and not (reused_existing or _touches_existing_tile(board, placements)):
-        return None
+    if board_has_tiles:
+        if not (reused_existing or _touches_existing_tile(board, placements)):
+            return None
+    else:
+        covers_b2 = any(p.row == 1 and p.col == 1 for p in placements)
+        if not covers_b2:
+            return None
 
     temporary_board = [row.copy() for row in board]
     for placement in placements:

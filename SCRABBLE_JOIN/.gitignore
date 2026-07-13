@@ -1,4 +1,33 @@
+# === Python ===
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyo
+*.pyd
 
+# === Environment Variables ===
+# Ignore all .env files EXCEPT the committed example template
+.env
+.env.*
+!.env.example
+
+# === Virtual Environments ===
+.venv/
+venv/
+env/
+ENV/
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Distribution / Build ===
+dist/
+build/
+*.egg-info/

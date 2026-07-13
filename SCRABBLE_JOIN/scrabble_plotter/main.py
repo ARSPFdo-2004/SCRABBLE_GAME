@@ -65,6 +65,12 @@ def _add_motion_args(parser: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
     parser = build_parser()
     args = parser.parse_args(argv)
 

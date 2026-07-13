@@ -87,7 +87,7 @@ class GCodeSender:
             return
 
         serial = _require_serial()
-        connection = serial.Serial(self.config.port, self.config.baud, timeout=self.config.timeout, write_timeout=self.config.timeout)
+        connection = serial.Serial(self.config.port, self.config.baud, timeout=self.config.timeout)
         try:
             connection.setDTR(False)
             connection.setRTS(False)
@@ -187,6 +187,21 @@ class BoardActuatorSender(GCodeSender):
     def clear_words(self) -> list[str]:
         return self.send_command("WORD_CLEAR")
 
-    def set_led_cells(self, labels: list[str]) -> list[str]:
-        payload = ",".join(label.strip().upper() for label in labels if label.strip())
+    def light_cells(self, squares: list[str]) -> list[str]:
+        payload = ",".join(square.strip().upper() for square in squares if square.strip())
+        if not payload:
+            raise ValueError("At least one LED cell is required.")
         return self.send_command(f"LED_CELLS {payload}")
+
+    def clear_lights(self) -> list[str]:
+        return self.send_command("LED_CLEAR")
+
+    def set_scores(self, player_1_score: int, player_2_score: int) -> list[str]:
+        return self.send_command(f"SCORE P1 {int(player_1_score)} P2 {int(player_2_score)}")
+
+    def take_challenge_choice(self) -> list[str]:
+        return self.send_command("CHALLENGE_TAKE")
+
+    def take_timer_button_press(self) -> list[str]:
+        return self.send_command("TIMER_TAKE")
+

@@ -116,6 +116,14 @@ def _configure_camera(
     elif zoom_out:
         camera.set(cv2.CAP_PROP_ZOOM, 0.0)
 
+    # Hardcoded defaults to reduce glare
+    if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+        camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0) # Manual exposure (Windows)
+    if hasattr(cv2, "CAP_PROP_EXPOSURE"):
+        camera.set(cv2.CAP_PROP_EXPOSURE, -8.0) # Even lower exposure
+    if hasattr(cv2, "CAP_PROP_CONTRAST"):
+        camera.set(cv2.CAP_PROP_CONTRAST, 130.0) # Higher contrast
+
 
 def _frame_has_pixels(frame: Any) -> bool:
     if frame is None:

@@ -118,6 +118,7 @@ def score_board(
     board_letters: list[list[str | None]],
     premium_layout: list[list[str]] | None = None,
     blank_squares: set[str] | None = None,
+    premium_squares: set[str] | None = None,
 ) -> ScoreResult:
     normalized_board = normalize_board_letters(board_letters)
     normalized_premiums = normalize_premium_layout(
@@ -125,12 +126,13 @@ def score_board(
         BOARD_SIZE,
     )
     blanks = {square.upper() for square in (blank_squares or set())}
+    active_premiums = None if premium_squares is None else {square.upper() for square in premium_squares}
     words: list[ScoredWord] = []
 
     for row in range(BOARD_SIZE):
-        words.extend(_score_line(normalized_board, normalized_premiums, blanks, row, 0, 0, 1, "horizontal"))
+        words.extend(_score_line(normalized_board, normalized_premiums, blanks, active_premiums, row, 0, 0, 1, "horizontal"))
     for col in range(BOARD_SIZE):
-        words.extend(_score_line(normalized_board, normalized_premiums, blanks, 0, col, 1, 0, "vertical"))
+        words.extend(_score_line(normalized_board, normalized_premiums, blanks, active_premiums, 0, col, 1, 0, "vertical"))
 
     return ScoreResult(total_score=sum(word.score for word in words), words=words)
 
@@ -169,6 +171,7 @@ def _score_line(
     board: list[list[str]],
     premium_layout: list[list[str]],
     blank_squares: set[str],
+    premium_squares: set[str] | None,
     start_row: int,
     start_col: int,
     row_step: int,
@@ -185,12 +188,12 @@ def _score_line(
         if letter:
             run.append((row, col, letter))
         else:
-            words.extend(_score_run(run, premium_layout, blank_squares, direction))
+            words.extend(_score_run(run, premium_layout, blank_squares, premium_squares, direction))
             run = []
         row += row_step
         col += col_step
 
-    words.extend(_score_run(run, premium_layout, blank_squares, direction))
+    words.extend(_score_run(run, premium_layout, blank_squares, premium_squares, direction))
     return words
 
 
@@ -198,6 +201,7 @@ def _score_run(
     run: list[tuple[int, int, str]],
     premium_layout: list[list[str]],
     blank_squares: set[str],
+    premium_squares: set[str] | None,
     direction: str,
 ) -> list[ScoredWord]:
     if len(run) < 2:
@@ -209,7 +213,7 @@ def _score_run(
 
     for row, col, letter in run:
         square = square_label(row, col)
-        premium = premium_layout[row][col]
+        premium = premium_layout[row][col] if premium_squares is None or square in premium_squares else PREMIUM_NORMAL
         blank = square in blank_squares
         face_value = 0 if blank else LETTER_VALUES.get(letter, 0)
         letter_multiplier = _letter_multiplier(premium)
